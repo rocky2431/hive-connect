@@ -584,6 +584,17 @@ func (p *WSPlatform) writeAndWaitAckWithTimeout(ctx context.Context, frame map[s
 	return result.err
 }
 
+func (p *WSPlatform) writeAndWaitAckStrict(ctx context.Context, frame map[string]any, reqID string, timeout time.Duration) error {
+	result, err := p.writeAndWaitResult(ctx, frame, reqID, timeout)
+	if errors.Is(err, errWSAckTimeout) {
+		return fmt.Errorf("wecom-ws: ack timeout waiting for %s", reqID)
+	}
+	if err != nil {
+		return err
+	}
+	return result.err
+}
+
 func (p *WSPlatform) writeAndWaitFrameWithTimeout(ctx context.Context, frame map[string]any, reqID string, timeout time.Duration) (wsFrame, error) {
 	result, err := p.writeAndWaitResult(ctx, frame, reqID, timeout)
 	if errors.Is(err, errWSAckTimeout) {

@@ -9899,6 +9899,7 @@ func TestWorkspace_Init_LocalDirAbsolute(t *testing.T) {
 	}
 	bindStore := filepath.Join(t.TempDir(), "bindings.json")
 	e.SetMultiWorkspace(baseDir, bindStore)
+	e.SetWorkspaceInitAllowLocalPaths(true)
 
 	msg := &Message{
 		SessionKey: "test:ch1:user1",
@@ -9926,6 +9927,7 @@ func TestWorkspace_Init_LocalDirRelative(t *testing.T) {
 	}
 	bindStore := filepath.Join(t.TempDir(), "bindings.json")
 	e.SetMultiWorkspace(baseDir, bindStore)
+	e.SetWorkspaceInitAllowLocalPaths(true)
 
 	// Use relative name — should resolve under baseDir.
 	msg := &Message{
@@ -9950,6 +9952,7 @@ func TestWorkspace_Init_LocalDirNotFound(t *testing.T) {
 	baseDir := t.TempDir()
 	bindStore := filepath.Join(t.TempDir(), "bindings.json")
 	e.SetMultiWorkspace(baseDir, bindStore)
+	e.SetWorkspaceInitAllowLocalPaths(true)
 
 	msg := &Message{
 		SessionKey: "test:ch1:user1",
@@ -9967,6 +9970,35 @@ func TestWorkspace_Init_LocalDirNotFound(t *testing.T) {
 	projectKey := "project:test"
 	if got := e.workspaceBindings.Lookup(projectKey, workspaceChannelKey("test", "ch1")); got != nil {
 		t.Fatalf("expected no binding for nonexistent dir, got %+v", got)
+	}
+}
+
+func TestWorkspace_Init_LocalDirDisabledByDefault(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+	baseDir := t.TempDir()
+	wsDir := filepath.Join(baseDir, "my-project")
+	if err := os.MkdirAll(wsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bindStore := filepath.Join(t.TempDir(), "bindings.json")
+	e.SetMultiWorkspace(baseDir, bindStore)
+
+	msg := &Message{
+		SessionKey: "test:ch1:user1",
+		Content:    "/workspace init " + wsDir,
+		ReplyCtx:   "ctx",
+		UserID:     "user1",
+	}
+	e.handleCommand(p, msg, msg.Content)
+
+	sent := p.getSent()
+	if len(sent) == 0 || !strings.Contains(sent[0], "workspace_init_allow_local_paths") {
+		t.Fatalf("expected local-path disabled reply, got %v", sent)
+	}
+	if got := e.workspaceBindings.Lookup("project:test", workspaceChannelKey("test", "ch1")); got != nil {
+		t.Fatalf("expected no binding when local init paths are disabled, got %+v", got)
 	}
 }
 
@@ -11030,9 +11062,9 @@ func (p *stubStreamingCardPlatform) CreateStreamingCard(_ context.Context, _ any
 // stubStreamingCard is a minimal StreamingCard for tests.
 type stubStreamingCard struct{}
 
-func (c *stubStreamingCard) Update(_ context.Context, _ string) error { return nil }
+func (c *stubStreamingCard) Update(_ context.Context, _ string) error   { return nil }
 func (c *stubStreamingCard) Finalize(_ context.Context, _ string) error { return nil }
-func (c *stubStreamingCard) Failed() bool                                { return false }
+func (c *stubStreamingCard) Failed() bool                               { return false }
 
 func TestHandleMessage_InstantReply_SendsConfirmationWhenEnabled(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}

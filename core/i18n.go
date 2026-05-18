@@ -291,8 +291,8 @@ const (
 	MsgCronBtnUnmute    MsgKey = "cron_btn_unmute"
 	MsgCronBtnDelete    MsgKey = "cron_btn_delete"
 
-	MsgStatusTitle          MsgKey = "status_title"
-	MsgReplyFooterRemaining MsgKey = "reply_footer_remaining"
+	MsgStatusTitle           MsgKey = "status_title"
+	MsgReplyFooterRemaining  MsgKey = "reply_footer_remaining"
 	MsgModelCurrent          MsgKey = "model_current"
 	MsgModelChanged          MsgKey = "model_changed"
 	MsgModelChangeFailed     MsgKey = "model_change_failed"
@@ -484,10 +484,10 @@ const (
 	MsgCommandDisabled   MsgKey = "command_disabled"
 	MsgAdminRequired     MsgKey = "admin_required"
 	MsgRateLimited       MsgKey = "rate_limited"
-	MsgPsSent       MsgKey = "ps_sent"
-	MsgPsSendFailed MsgKey = "ps_send_failed"
-	MsgPsEmpty      MsgKey = "ps_empty"
-	MsgPsNoSession  MsgKey = "ps_no_session"
+	MsgPsSent            MsgKey = "ps_sent"
+	MsgPsSendFailed      MsgKey = "ps_send_failed"
+	MsgPsEmpty           MsgKey = "ps_empty"
+	MsgPsNoSession       MsgKey = "ps_no_session"
 
 	MsgWhoamiTitle     MsgKey = "whoami_title"
 	MsgWhoamiCardTitle MsgKey = "whoami_card_title"
@@ -582,39 +582,41 @@ const (
 	MsgShowReadFailed      MsgKey = "show_read_failed"
 
 	// Multi-workspace messages
-	MsgWsNotEnabled            MsgKey = "ws_not_enabled"
-	MsgWsNoBinding             MsgKey = "ws_no_binding"
-	MsgWsInfo                  MsgKey = "ws_info"
-	MsgWsInfoShared            MsgKey = "ws_info_shared"
-	MsgWsUsage                 MsgKey = "ws_usage"
-	MsgWsInitUsage             MsgKey = "ws_init_usage"
-	MsgWsBindUsage             MsgKey = "ws_bind_usage"
-	MsgWsBindSuccess           MsgKey = "ws_bind_success"
-	MsgWsBindNotFound          MsgKey = "ws_bind_not_found"
-	MsgWsRouteUsage            MsgKey = "ws_route_usage"
-	MsgWsRouteSuccess          MsgKey = "ws_route_success"
-	MsgWsRouteAbsoluteRequired MsgKey = "ws_route_absolute_required"
-	MsgWsRouteNotFound         MsgKey = "ws_route_not_found"
-	MsgWsRouteNotDirectory     MsgKey = "ws_route_not_directory"
-	MsgWsUnbindSuccess         MsgKey = "ws_unbind_success"
-	MsgWsListEmpty             MsgKey = "ws_list_empty"
-	MsgWsListTitle             MsgKey = "ws_list_title"
-	MsgWsSharedNoBinding       MsgKey = "ws_shared_no_binding"
-	MsgWsSharedUsage           MsgKey = "ws_shared_usage"
-	MsgWsSharedBindSuccess     MsgKey = "ws_shared_bind_success"
-	MsgWsSharedRouteSuccess    MsgKey = "ws_shared_route_success"
-	MsgWsSharedUnbindSuccess   MsgKey = "ws_shared_unbind_success"
-	MsgWsSharedListEmpty       MsgKey = "ws_shared_list_empty"
-	MsgWsSharedListTitle       MsgKey = "ws_shared_list_title"
-	MsgWsSharedOnlyHint        MsgKey = "ws_shared_only_hint"
-	MsgWsNotFoundHint          MsgKey = "ws_not_found_hint"
-	MsgWsResolutionError       MsgKey = "ws_resolution_error"
-	MsgWsCloneProgress         MsgKey = "ws_clone_progress"
-	MsgWsCloneSuccess          MsgKey = "ws_clone_success"
-	MsgWsCloneFailed           MsgKey = "ws_clone_failed"
-	MsgWsInitDirNotFound       MsgKey = "ws_init_dir_not_found"
-	MsgWsInitInvalidTarget     MsgKey = "ws_init_invalid_target"
-	MsgBackgroundAutoDenied    MsgKey = "background_auto_denied"
+	MsgWsNotEnabled             MsgKey = "ws_not_enabled"
+	MsgWsNoBinding              MsgKey = "ws_no_binding"
+	MsgWsInfo                   MsgKey = "ws_info"
+	MsgWsInfoShared             MsgKey = "ws_info_shared"
+	MsgWsUsage                  MsgKey = "ws_usage"
+	MsgWsInitUsage              MsgKey = "ws_init_usage"
+	MsgWsBindUsage              MsgKey = "ws_bind_usage"
+	MsgWsBindSuccess            MsgKey = "ws_bind_success"
+	MsgWsBindNotFound           MsgKey = "ws_bind_not_found"
+	MsgWsRouteUsage             MsgKey = "ws_route_usage"
+	MsgWsRouteSuccess           MsgKey = "ws_route_success"
+	MsgWsRouteAbsoluteRequired  MsgKey = "ws_route_absolute_required"
+	MsgWsRouteNotFound          MsgKey = "ws_route_not_found"
+	MsgWsRouteNotDirectory      MsgKey = "ws_route_not_directory"
+	MsgWsUnbindSuccess          MsgKey = "ws_unbind_success"
+	MsgWsListEmpty              MsgKey = "ws_list_empty"
+	MsgWsListTitle              MsgKey = "ws_list_title"
+	MsgWsSharedNoBinding        MsgKey = "ws_shared_no_binding"
+	MsgWsSharedUsage            MsgKey = "ws_shared_usage"
+	MsgWsSharedBindSuccess      MsgKey = "ws_shared_bind_success"
+	MsgWsSharedRouteSuccess     MsgKey = "ws_shared_route_success"
+	MsgWsSharedUnbindSuccess    MsgKey = "ws_shared_unbind_success"
+	MsgWsSharedListEmpty        MsgKey = "ws_shared_list_empty"
+	MsgWsSharedListTitle        MsgKey = "ws_shared_list_title"
+	MsgWsSharedOnlyHint         MsgKey = "ws_shared_only_hint"
+	MsgWsNotFoundHint           MsgKey = "ws_not_found_hint"
+	MsgWsNotFoundHintGitOnly    MsgKey = "ws_not_found_hint_git_only"
+	MsgWsResolutionError        MsgKey = "ws_resolution_error"
+	MsgWsCloneProgress          MsgKey = "ws_clone_progress"
+	MsgWsCloneSuccess           MsgKey = "ws_clone_success"
+	MsgWsCloneFailed            MsgKey = "ws_clone_failed"
+	MsgWsInitDirNotFound        MsgKey = "ws_init_dir_not_found"
+	MsgWsInitInvalidTarget      MsgKey = "ws_init_invalid_target"
+	MsgWsInitLocalPathsDisabled MsgKey = "ws_init_local_paths_disabled"
+	MsgBackgroundAutoDenied     MsgKey = "background_auto_denied"
 )
 
 var messages = map[MsgKey]map[Language]string{
@@ -3901,6 +3903,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "このチャンネルにワークスペースが見つかりません。git URL またはローカルディレクトリパスを送信するか、`/workspace init <urlまたはパス>` を使用してください。",
 		LangSpanish:            "No se encontró workspace para este canal. Envía una URL de repo git, una ruta de directorio local, o usa `/workspace init <url-o-ruta>`.",
 	},
+	MsgWsNotFoundHintGitOnly: {
+		LangEnglish:            "No workspace found for this channel. Send a git repo URL or use `/workspace init <git-url>`.",
+		LangChinese:            "此频道未找到工作区。请发送 git 仓库地址，或使用 `/workspace init <git仓库地址>`。",
+		LangTraditionalChinese: "此頻道未找到工作區。請發送 git 倉庫地址，或使用 `/workspace init <git倉庫地址>`。",
+		LangJapanese:           "このチャンネルにワークスペースが見つかりません。git URL を送信するか、`/workspace init <git-url>` を使用してください。",
+		LangSpanish:            "No se encontró workspace para este canal. Envía una URL de repo git o usa `/workspace init <git-url>`.",
+	},
 	MsgWsResolutionError: {
 		LangEnglish:            "Workspace resolution error: %v",
 		LangChinese:            "工作区解析错误: %v",
@@ -3942,6 +3951,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "請提供 git 倉庫地址（如 `https://github.com/org/repo`）或本地目錄路徑。",
 		LangJapanese:           "git URL（例: `https://github.com/org/repo`）またはローカルディレクトリパスを指定してください。",
 		LangSpanish:            "Proporcione una URL de git (ej. `https://github.com/org/repo`) o una ruta de directorio local.",
+	},
+	MsgWsInitLocalPathsDisabled: {
+		LangEnglish:            "Local directory targets are disabled for `/workspace init`. Use a git URL, or enable `workspace_init_allow_local_paths = true` for this project.",
+		LangChinese:            "`/workspace init` 未启用本地目录目标。请使用 git 仓库地址，或在此项目配置 `workspace_init_allow_local_paths = true`。",
+		LangTraditionalChinese: "`/workspace init` 未啟用本機目錄目標。請使用 git 倉庫地址，或在此專案配置 `workspace_init_allow_local_paths = true`。",
+		LangJapanese:           "`/workspace init` ではローカルディレクトリ対象が無効です。git URL を使うか、このプロジェクトで `workspace_init_allow_local_paths = true` を有効にしてください。",
+		LangSpanish:            "Los destinos de directorio local están deshabilitados para `/workspace init`. Use una URL de git o habilite `workspace_init_allow_local_paths = true` para este proyecto.",
 	},
 }
 

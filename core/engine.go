@@ -242,12 +242,13 @@ type Engine struct {
 	filterExternalSessions bool
 
 	// Multi-workspace mode
-	multiWorkspace    bool
-	baseDir           string
-	workspaceBindings *WorkspaceBindingManager
-	workspacePool     *workspacePool
-	initFlows         map[string]*workspaceInitFlow // workspace channel key → init state
-	initFlowsMu       sync.Mutex
+	multiWorkspace               bool
+	baseDir                      string
+	workspaceInitAllowLocalPaths bool
+	workspaceBindings            *WorkspaceBindingManager
+	workspacePool                *workspacePool
+	initFlows                    map[string]*workspaceInitFlow // workspace channel key → init state
+	initFlowsMu                  sync.Mutex
 
 	// Terminal observation (--observe)
 	observeEnabled    bool
@@ -465,6 +466,12 @@ func (e *Engine) SetWorkspaceIdleTimeout(d time.Duration) {
 		e.workspacePool.idleTimeout = d
 		e.workspacePool.mu.Unlock()
 	}
+}
+
+// SetWorkspaceInitAllowLocalPaths controls whether workspace init accepts
+// existing local directories as targets. When false, init remains git-URL only.
+func (e *Engine) SetWorkspaceInitAllowLocalPaths(allow bool) {
+	e.workspaceInitAllowLocalPaths = allow
 }
 
 func (e *Engine) runIdleReaper() {
@@ -3091,7 +3098,6 @@ func buildCardContent(thinking string, tools []cardToolEntry, answer string) str
 	return sb.String()
 }
 
-
 // unsolicitedReaderStopTimeout bounds how long stopUnsolicitedReader waits
 // for the reader goroutine to exit. The reader is structured so its iterations
 // are short (blocking adapter calls like RespondPermission are offloaded), so
@@ -3434,8 +3440,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 	// Streaming card: aggregate entire turn into a single updatable card.
 	var streamCard StreamingCard
-	var cardToolCalls []cardToolEntry // track tool calls for card content
-	var cardThinkingText string       // latest thinking text
+	var cardToolCalls []cardToolEntry  // track tool calls for card content
+	var cardThinkingText string        // latest thinking text
 	var cardAnswerText strings.Builder // accumulated answer text
 
 	if scp, ok := state.platform.(StreamingCardPlatform); ok {
@@ -4962,7 +4968,7 @@ func (e *Engine) handleWorkspaceCommand(p Platform, msg *Message, args []string)
 	}
 	initWorkspace := func(bindingKey, target string, successKey MsgKey) bool {
 		// Support local directory paths (absolute or relative to baseDir).
-		if looksLikeLocalDir(target) {
+		if e.workspaceInitAllowLocalPaths && looksLikeLocalDir(target) {
 			dirPath, err := resolveLocalDirPath(target, e.baseDir)
 			if err != nil {
 				e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsInitDirNotFound, target))
@@ -4976,6 +4982,10 @@ func (e *Engine) handleWorkspaceCommand(p Platform, msg *Message, args []string)
 			e.workspaceBindings.Bind(bindingKey, channelKey, resolveChannelName(), normalizeWorkspacePath(dirPath))
 			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsBindSuccess, dirPath))
 			return true
+		}
+		if !e.workspaceInitAllowLocalPaths && looksLikeLocalDir(target) && !looksLikeGitURL(target) {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgWsInitLocalPathsDisabled))
+			return false
 		}
 
 		if !looksLikeGitURL(target) {
@@ -13411,9 +13421,10 @@ func (e *Engine) handleWorkspaceInitFlow(p Platform, msg *Message, channelName s
 	e.initFlowsMu.Unlock()
 
 	content := strings.TrimSpace(msg.Content)
+	looksLikeAllowedLocalDir := e.workspaceInitAllowLocalPaths && looksLikeLocalDir(content)
 
 	if !exists {
-		if strings.HasPrefix(content, "/") && !looksLikeLocalDir(content) {
+		if strings.HasPrefix(content, "/") && !looksLikeAllowedLocalDir {
 			return false
 		}
 		// Create the flow so that follow-up messages are handled.
@@ -13426,8 +13437,12 @@ func (e *Engine) handleWorkspaceInitFlow(p Platform, msg *Message, channelName s
 		e.initFlowsMu.Unlock()
 		// If the first message is already a path or URL, process it now;
 		// otherwise show the hint and wait for the next message.
-		if !looksLikeLocalDir(content) && !looksLikeGitURL(content) {
-			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgWsNotFoundHint))
+		if !looksLikeAllowedLocalDir && !looksLikeGitURL(content) {
+			hintKey := MsgWsNotFoundHintGitOnly
+			if e.workspaceInitAllowLocalPaths {
+				hintKey = MsgWsNotFoundHint
+			}
+			e.reply(p, msg.ReplyCtx, e.i18n.T(hintKey))
 			return true
 		}
 	}
@@ -13435,7 +13450,7 @@ func (e *Engine) handleWorkspaceInitFlow(p Platform, msg *Message, channelName s
 	// Slash commands always take priority over the init flow — let them
 	// pass through to handleCommand. Clean up the stale flow since the
 	// user is issuing explicit commands instead of following the clone guide.
-	if exists && strings.HasPrefix(content, "/") && !looksLikeLocalDir(content) {
+	if exists && strings.HasPrefix(content, "/") && !looksLikeAllowedLocalDir {
 		e.initFlowsMu.Lock()
 		delete(e.initFlows, channelKey)
 		e.initFlowsMu.Unlock()
@@ -13445,7 +13460,7 @@ func (e *Engine) handleWorkspaceInitFlow(p Platform, msg *Message, channelName s
 	switch flow.state {
 	case "awaiting_url":
 		// Accept local directory paths: bind directly without cloning.
-		if looksLikeLocalDir(content) {
+		if looksLikeAllowedLocalDir {
 			dirPath, resolveErr := resolveLocalDirPath(content, e.baseDir)
 			if resolveErr != nil {
 				e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsInitDirNotFound, content))
@@ -13462,6 +13477,10 @@ func (e *Engine) handleWorkspaceInitFlow(p Platform, msg *Message, channelName s
 			delete(e.initFlows, channelKey)
 			e.initFlowsMu.Unlock()
 			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsBindSuccess, dirPath))
+			return true
+		}
+		if !e.workspaceInitAllowLocalPaths && looksLikeLocalDir(content) && !looksLikeGitURL(content) {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgWsInitLocalPathsDisabled))
 			return true
 		}
 

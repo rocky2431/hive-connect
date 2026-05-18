@@ -606,6 +606,7 @@ level = "info" # debug, info, warn, error
 # name = "claude-multi"
 # mode = "multi-workspace"
 # base_dir = "~/workspace"
+# workspace_init_allow_local_paths = true  # Optional: allow /workspace init <local-dir>; default false keeps init git-URL only
 #
 # [projects.agent]
 # type = "claudecode"

@@ -135,7 +135,7 @@ func (p *WSPlatform) sendWSMediaMessage(ctx context.Context, chatID, mediaType, 
 			},
 		},
 	}
-	return p.writeAndWaitAck(ctx, frame, reqID)
+	return p.writeAndWaitAckStrict(ctx, frame, reqID, wsMediaAckTimeout)
 }
 
 func wsImageFileName(img core.ImageAttachment) string {

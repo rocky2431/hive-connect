@@ -143,9 +143,10 @@ func (a *Agent) PermissionModes() []core.PermissionModeInfo {
 // ── SkillProvider ────────────────────────────────────────────
 
 func (a *Agent) SkillDirs() []string {
-	absDir, err := filepath.Abs(a.workDir)
+	workDir := a.GetWorkDir()
+	absDir, err := filepath.Abs(workDir)
 	if err != nil {
-		absDir = a.workDir
+		absDir = workDir
 	}
 	dirs := []string{filepath.Join(absDir, ".claude", "skills")}
 	if home, err := os.UserHomeDir(); err == nil {
@@ -161,9 +162,10 @@ func (a *Agent) CompressCommand() string { return "/compact" }
 // ── MemoryFileProvider ───────────────────────────────────────
 
 func (a *Agent) ProjectMemoryFile() string {
-	absDir, err := filepath.Abs(a.workDir)
+	workDir := a.GetWorkDir()
+	absDir, err := filepath.Abs(workDir)
 	if err != nil {
-		absDir = a.workDir
+		absDir = workDir
 	}
 	return filepath.Join(absDir, "AGENTS.md")
 }
