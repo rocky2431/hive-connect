@@ -10,7 +10,13 @@ npm install -g @hiveclaw243/hive-connect
 
 ## Login
 
-Copy the setup instruction from Hive. It opens Hive in the browser and completes device-flow authentication automatically:
+For normal Hive Cloud users, no URL is required. `hive-connect login` defaults to Hive production, opens Hive in the browser, and completes device-flow authentication automatically:
+
+```bash
+hive-connect login
+```
+
+For self-hosted or test Hive environments, override the Hive origin:
 
 ```bash
 hive-connect login --hive-url https://your-hive.example.com

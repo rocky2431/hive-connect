@@ -22,6 +22,7 @@ import (
 const (
 	hiveConnectClientKind = "hive-connect"
 	hiveConnectAPIPrefix  = "/api"
+	defaultHiveURL        = "https://frontend-production-0346.up.railway.app"
 )
 
 type hiveLoginConfig struct {
@@ -81,7 +82,7 @@ func rewriteHiveRunArgs(args []string) []string {
 	configPath := defaultHiveConnectConfigPath()
 	if _, err := os.Stat(configPath); err != nil {
 		fmt.Fprintf(os.Stderr, "Hive Connect config not found: %s\n", configPath)
-		fmt.Fprintln(os.Stderr, "Run `hive-connect login --hive-url <your Hive URL>` first.")
+		fmt.Fprintln(os.Stderr, "Run `hive-connect login` first.")
 		os.Exit(1)
 	}
 	return append([]string{args[0], "--config", configPath}, rest...)
@@ -101,7 +102,11 @@ func hasConfigArg(args []string) bool {
 
 func runHiveLogin(args []string) {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
-	hiveURL := fs.String("hive-url", firstHiveNonEmpty(os.Getenv("HIVE_BACKEND_URL"), os.Getenv("HIVE_URL")), "Hive web or backend origin")
+	hiveURL := fs.String(
+		"hive-url",
+		firstHiveNonEmpty(os.Getenv("HIVE_BACKEND_URL"), os.Getenv("HIVE_URL"), defaultHiveURL),
+		"Override Hive web or backend origin for self-hosted or test environments",
+	)
 	apiPrefix := fs.String("api-prefix", firstHiveNonEmpty(os.Getenv("HIVE_API_PREFIX"), hiveConnectAPIPrefix), "Hive API prefix")
 	agentType := fs.String("agent", firstHiveNonEmpty(os.Getenv("HIVE_AGENT_TYPE"), "codex"), "Local agent runtime type: codex, claudecode, cursor, gemini, opencode, qoder, iflow")
 	workDir := fs.String("work-dir", defaultHiveWorkDir(), "Workspace directory passed to the local agent")
@@ -110,15 +115,10 @@ func runHiveLogin(args []string) {
 	noBrowser := fs.Bool("no-browser", false, "Print activation URL instead of opening the browser")
 	timeout := fs.Duration("timeout", 15*time.Minute, "Maximum time to wait for browser approval")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: hive-connect login --hive-url https://your-hive.example.com [options]")
+		fmt.Fprintln(os.Stderr, "Usage: hive-connect login [--hive-url https://your-hive.example.com] [options]")
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(args)
-
-	if strings.TrimSpace(*hiveURL) == "" {
-		fmt.Fprintln(os.Stderr, "Error: --hive-url is required. Use the copied setup instruction from Hive.")
-		os.Exit(1)
-	}
 
 	session, err := performHiveLogin(context.Background(), hiveLoginConfig{
 		ProjectName: firstHiveNonEmpty(*projectName, defaultHiveProjectName(*agentType, *deviceName)),
@@ -152,7 +152,7 @@ func runHiveStatus(args []string) {
 	prefix := firstHiveNonEmpty(*apiPrefix, session.APIPrefix, os.Getenv("HIVE_API_PREFIX"), hiveConnectAPIPrefix)
 	bridgeToken := firstHiveNonEmpty(*token, session.Token, os.Getenv("HIVE_CONNECT_TOKEN"), os.Getenv("HIVE_BRIDGE_TOKEN"))
 	if backendURL == "" || bridgeToken == "" {
-		fmt.Fprintln(os.Stderr, "Hive Connect is not logged in. Run `hive-connect login --hive-url <your Hive URL>` first.")
+		fmt.Fprintln(os.Stderr, "Hive Connect is not logged in. Run `hive-connect login` first.")
 		os.Exit(1)
 	}
 	statusURL, err := hiveAPIURL(backendURL, prefix, "/local-bridge/status")

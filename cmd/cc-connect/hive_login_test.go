@@ -15,6 +15,12 @@ func TestHiveAPIURLBuildsPrefixedEndpoint(t *testing.T) {
 	}
 }
 
+func TestDefaultHiveURLUsesProductionWebOrigin(t *testing.T) {
+	if defaultHiveURL != "https://frontend-production-0346.up.railway.app" {
+		t.Fatalf("defaultHiveURL = %q", defaultHiveURL)
+	}
+}
+
 func TestRenderHiveConnectConfigUsesHivePlatformOnly(t *testing.T) {
 	cfg := renderHiveConnectConfig(hiveLoginConfig{
 		ProjectName: "codex-on-mac",

@@ -325,8 +325,11 @@ func captureStderr(t *testing.T, fn func()) string {
 func TestPrintUsage_ListsHiveConnectCommands(t *testing.T) {
 	out := captureStderr(t, printUsage)
 
-	if !strings.Contains(out, "hive-connect login --hive-url <Hive URL>") {
+	if !strings.Contains(out, "hive-connect login [flags]") {
 		t.Fatalf("printUsage() output missing Hive login usage:\n%s", out)
+	}
+	if !strings.Contains(out, "hive-connect login --hive-url https://your-hive.example.com") {
+		t.Fatalf("printUsage() output missing self-hosted Hive login example:\n%s", out)
 	}
 	if !strings.Contains(out, "run                Start the local Hive runner with the saved Hive config") {
 		t.Fatalf("printUsage() output missing Hive run command:\n%s", out)

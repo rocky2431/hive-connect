@@ -28,4 +28,7 @@ assert.doesNotMatch(runJs, /\[cc-connect]/);
 assert.match(readme, /^# Hive Connect/m);
 assert.match(readme, /npm install -g @hiveclaw243\/hive-connect/);
 assert.match(readme, /hive-connect login/);
+assert.match(readme, /defaults to Hive production/);
+assert.match(readme, /For self-hosted or test Hive environments/);
+assert.match(readme, /hive-connect login --hive-url https:\/\/your-hive\.example\.com/);
 assert.doesNotMatch(readme, /cc-connect/);

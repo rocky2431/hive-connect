@@ -1566,7 +1566,7 @@ Hive Connect %s%s
   NPM:     @hiveclaw243/hive-connect
 
 Usage:
-  hive-connect login --hive-url <Hive URL> [flags]
+  hive-connect login [flags]
   hive-connect run [flags]
   hive-connect status [flags]
 
@@ -1586,7 +1586,8 @@ Commands:
   config             Manage configuration
 
 Examples:
-  hive-connect login --hive-url https://your-hive.example.com
+  hive-connect login
+  hive-connect login --hive-url https://your-hive.example.com   # self-hosted or test Hive
   hive-connect run
   hive-connect status
   hive-connect daemon install --config ~/.hive-connect/config.toml
