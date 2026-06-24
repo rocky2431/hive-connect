@@ -1,6 +1,6 @@
 {
   "name": "@hiveclaw243/hive-connect",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Connect local AI agents to Hive as a user-scoped IM channel",
   "keywords": [
     "hive",
@@ -15,7 +15,7 @@
   "homepage": "https://github.com/rocky2431/hive-connect",
   "repository": {
     "type": "git",
-    "url": "https://github.com/rocky2431/hive-connect.git"
+    "url": "git+https://github.com/rocky2431/hive-connect.git"
   },
   "license": "MIT",
   "author": "HiveClaw",
