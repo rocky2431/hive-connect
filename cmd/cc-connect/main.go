@@ -243,6 +243,14 @@ func main() {
 		case "daemon":
 			runDaemon(os.Args[2:])
 			return
+		case "login":
+			runHiveLogin(os.Args[2:])
+			return
+		case "status":
+			runHiveStatus(os.Args[2:])
+			return
+		case "run":
+			os.Args = rewriteHiveRunArgs(os.Args)
 		case "feishu":
 			runFeishu(os.Args[2:])
 			return
@@ -256,6 +264,8 @@ func main() {
 			runWeb(os.Args[2:])
 			return
 		}
+	} else {
+		os.Args = rewriteHiveRunArgs([]string{os.Args[0], "run"})
 	}
 
 	// When started as a daemon (CC_LOG_FILE set), redirect logs to a rotating file.
@@ -304,11 +314,11 @@ func main() {
 	}
 
 	if *showVersion {
-		fmt.Printf("cc-connect %s\ncommit:  %s\nbuilt:   %s\n", version, commit, buildTime)
+		fmt.Printf("hive-connect %s\ncommit:  %s\nbuilt:   %s\n", version, commit, buildTime)
 		return
 	}
 
-	core.VersionInfo = fmt.Sprintf("cc-connect %s\ncommit: %s\nbuilt: %s", version, commit, buildTime)
+	core.VersionInfo = fmt.Sprintf("hive-connect %s\ncommit: %s\nbuilt: %s", version, commit, buildTime)
 	core.CurrentVersion = version
 	core.CurrentCommit = commit
 	core.CurrentBuildTime = buildTime
@@ -1303,7 +1313,7 @@ func main() {
 		apiSrv.Start()
 	}
 
-	slog.Info("cc-connect is running", "projects", len(engines))
+	slog.Info("hive-connect is running", "projects", len(engines))
 
 	// After startup, check if we were restarted and queue the success
 	// notification. The engine dispatches it on the first OnPlatformReady
@@ -1547,94 +1557,39 @@ func printUsage() {
 	updateHint := getUpdateHintIfAvailable()
 
 	fmt.Fprintf(os.Stderr, `
-                                              _
-  ___ ___        ___ ___  _ __  _ __   ___  ___| |_
- / __/ __|_____ / __/ _ \| '_ \| '_ \ / _ \/ __| __|
-| (_| (_|_____|  (_| (_) | | | | | | |  __/ (__| |_
- \___\__|      \___\___/|_| |_|_| |_|\___|\___|\__|  %s%s
+Hive Connect %s%s
 
-  Bridge your messaging platforms to local AI coding agents.
-  Supports: Claude Code, Codex, Cursor, Gemini CLI, Qoder CLI, OpenCode
-  Platforms: Feishu, Telegram, Slack, DingTalk, Discord, LINE, WeChat Work, Weixin, QQ, QQ Bot
+  Connect this machine's local AI agent to Hive as a user-scoped IM channel.
+  Default flow: install -> login -> run.
 
-  GitHub:  https://github.com/chenhg5/cc-connect
-  Docs:    https://github.com/chenhg5/cc-connect/blob/main/INSTALL.md
+  GitHub:  https://github.com/rocky2431/hive-connect
+  NPM:     @hiveclaw243/hive-connect
 
 Usage:
-  cc-connect [flags]
-  cc-connect <command> [args]
+  hive-connect login --hive-url <Hive URL> [flags]
+  hive-connect run [flags]
+  hive-connect status [flags]
 
 Flags:
-  --config <path>    Path to config file (default: ./config.toml or ~/.cc-connect/config.toml)
+  --config <path>    Path to config file
   --force            Kill any existing instance with the same config before starting
   --version          Print version and exit
   --help             Show this help message
 
 Commands:
-  daemon             Manage cc-connect as a background service (systemd/launchd/schtasks)
-    install          Install and start the daemon service
-    uninstall        Remove the daemon service
-    start            Start the daemon
-    stop             Stop the daemon
-    restart          Restart the daemon
-    status           Show daemon status
-    logs             View daemon logs (-f to follow, -n N for last N lines)
-
-  send               Send a message to an active session via internal API
-                     (-m <text> | --stdin, -p <project>, -s <session>)
-
-  cron               Manage scheduled tasks
-    add              Create a scheduled task (-c <expr> --prompt <text>)
-    list             List scheduled tasks
-    exec             Trigger a scheduled task immediately
-    del              Delete a scheduled task by ID
-
+  login              Browser device-flow login; writes ~/.hive-connect/config.toml
+  run                Start the local Hive runner with the saved Hive config
+  status             Check the saved Hive bridge token
+  daemon             Manage the runner as a background service
+  send               Send a message or attachment to an active local session
   sessions           Browse session history
-    list             List all sessions (pipe-friendly)
-    show <id>        Show session messages (-n N for last N)
-
-  agent-sid          Print the agent session ID for the current session
-
-  relay              Cross-project message relay
-    send             Send a message to another project and get the response
-
-  provider           Manage API providers for projects
-    add              Add a provider (--project, --name, --api-key, ...)
-    list             List providers (--project)
-    remove           Remove a provider (--project, --name)
-    import           Import providers from cc-switch
-
-  feishu             Setup Feishu/Lark bot credentials
-    setup            Smart setup (QR create or bind when --app is provided)
-    new              Force QR onboarding to create a new bot
-    bind             Bind existing app_id/app_secret
-
-  weixin             Setup Weixin personal (ilink) via QR or token
-    setup            QR login, or bind when --token is provided
-    new              Force QR login
-    bind             Bind existing ilink bot token
-
   config             Manage configuration
-    example          Print a complete annotated config.toml example
-    format           Format the config file (alias: fmt)
-    path             Print the resolved config file path
-
-  update             Check for updates and upgrade the binary (--pre for beta)
-  check-update       Check if a newer version is available
-  config-example     (deprecated: use 'config example' instead)
 
 Examples:
-  cc-connect                          Start with default config
-  cc-connect --config /path/to.toml   Start with a specific config file
-  cc-connect daemon install           Install as a system service
-  cc-connect daemon logs -f           Follow daemon logs
-  cc-connect send -m "hello"          Send a message to the active session
-  cc-connect cron list                List all scheduled tasks
-  cc-connect feishu setup             Setup Feishu/Lark bot credentials
-  cc-connect weixin setup             Setup Weixin (ilink) with QR or --token
-  cc-connect update                   Update to the latest version
-  cc-connect config format            Format the config file
-  cc-connect config example > c.toml  Save example config to a file
+  hive-connect login --hive-url https://your-hive.example.com
+  hive-connect run
+  hive-connect status
+  hive-connect daemon install --config ~/.hive-connect/config.toml
 
 `, v, updateHint)
 }

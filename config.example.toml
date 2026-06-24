@@ -968,6 +968,31 @@ mode = "default" # "default" | "acceptEdits" (edit) | "plan" | "auto" | "bypassP
 # marker_style = "emoji"            # none | ascii | emoji
 # enclosure_style = "code"          # none | bracket | angle | fullwidth | code
 
+# Hive Cloud local agent channel / Hive 云端本地 Agent 通道
+# This makes Hive Cloud act as an IM platform for the local agent runner.
+# 这会把 Hive 云端作为本地 Agent runner 的 IM 通道。
+#
+# Required:
+#   backend_url: Hive backend origin, e.g. https://api.example.com
+#   token:       hb_* token returned by hive-connect login
+#
+# Optional:
+#   api_prefix:   API prefix, default "/api"
+#   runtime_kind: Local agent runtime name displayed in Hive, default "hive-connect"
+#   device_name:  Local device name displayed in Hive
+#   allow_from:   Owner user IDs allowed to invoke this runner; "*" or empty allows all token-authorized owners
+#
+# [[projects.platforms]]
+# type = "hive"
+#
+# [projects.platforms.options]
+# backend_url = "${HIVE_BACKEND_URL}"
+# token = "${HIVE_CONNECT_TOKEN}"
+# api_prefix = "/api"
+# runtime_kind = "codex"
+# device_name = "Rocky Mac"
+# allow_from = "*"
+
 # Feishu / Lark / 飞书
 # 1. Create an app at https://open.feishu.cn / 在 https://open.feishu.cn 创建应用
 # 2. Enable Bot capability / 开启机器人能力

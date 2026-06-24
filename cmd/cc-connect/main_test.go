@@ -322,14 +322,17 @@ func captureStderr(t *testing.T, fn func()) string {
 	return buf.String()
 }
 
-func TestPrintUsage_ListsCronExecCommand(t *testing.T) {
+func TestPrintUsage_ListsHiveConnectCommands(t *testing.T) {
 	out := captureStderr(t, printUsage)
 
-	if !strings.Contains(out, "Manage scheduled tasks") {
-		t.Fatalf("printUsage() output missing cron section:\n%s", out)
+	if !strings.Contains(out, "hive-connect login --hive-url <Hive URL>") {
+		t.Fatalf("printUsage() output missing Hive login usage:\n%s", out)
 	}
-	if !strings.Contains(out, "exec             Trigger a scheduled task immediately") {
-		t.Fatalf("printUsage() output missing cron exec command:\n%s", out)
+	if !strings.Contains(out, "run                Start the local Hive runner with the saved Hive config") {
+		t.Fatalf("printUsage() output missing Hive run command:\n%s", out)
+	}
+	if !strings.Contains(out, "status             Check the saved Hive bridge token") {
+		t.Fatalf("printUsage() output missing Hive status command:\n%s", out)
 	}
 }
 

@@ -1,9 +1,9 @@
-APP        := cc-connect
+APP        := hive-connect
 MODULE     := github.com/chenhg5/cc-connect
 CMD        := ./cmd/cc-connect
 DIST       := dist
 
-VERSION := v1.3.3
+VERSION := v0.1.0
 COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
 BUILD_TIME := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 
@@ -34,7 +34,7 @@ PLATFORMS := \
 # ---------------------------------------------------------------------------
 
 ALL_AGENTS    := acp antigravity claudecode codex copilot cursor devin gemini iflow kimi opencode pi qoder tmux
-ALL_PLATFORMS := feishu telegram discord slack dingtalk wecom weixin qq qqbot line weibo max matrix webex
+ALL_PLATFORMS := hive feishu telegram discord slack dingtalk wecom weixin qq qqbot line weibo max matrix webex
 ALL_EXTRAS    := web
 
 COMMA := ,

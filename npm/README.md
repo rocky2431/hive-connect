@@ -1,26 +1,31 @@
-# cc-connect
+# Hive Connect
 
-Bridge local AI coding agents (Claude Code, Cursor, Gemini CLI, Codex) to messaging platforms (Feishu/Lark, DingTalk, Slack, Telegram, Discord, LINE, WeChat Work).
-
-Chat with your AI dev assistant from anywhere.
+Connect a local AI agent to Hive as a user-scoped IM channel.
 
 ## Install
 
 ```bash
-npm install -g cc-connect
+npm install -g @hiveclaw243/hive-connect
 ```
 
-## Usage
+## Login
+
+Copy the setup instruction from Hive. It opens Hive in the browser and completes device-flow authentication automatically:
 
 ```bash
-# Create config
-cc-connect --version
-
-# Edit config.toml, then run
-cc-connect
-cc-connect -config /path/to/config.toml
+hive-connect login --hive-url https://your-hive.example.com
 ```
 
-## Documentation
+## Run
 
-See full documentation at: https://github.com/chenhg5/cc-connect
+```bash
+hive-connect run
+```
+
+## Check Status
+
+```bash
+hive-connect status
+```
+
+The login command writes `~/.hive-connect/config.toml` and stores the local `hb_*` token with user-only file permissions.
