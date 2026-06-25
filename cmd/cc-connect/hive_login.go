@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	appconfig "github.com/chenhg5/cc-connect/config"
 )
 
 const (
@@ -374,10 +376,59 @@ func readHiveConnectSession() (hiveConnectSession, error) {
 	var session hiveConnectSession
 	data, err := os.ReadFile(defaultHiveConnectSessionPath())
 	if err != nil {
+		return readHiveConnectSessionFromConfig(defaultHiveConnectConfigPath())
+	}
+	if err := json.Unmarshal(data, &session); err != nil {
+		return readHiveConnectSessionFromConfig(defaultHiveConnectConfigPath())
+	}
+	return session, nil
+}
+
+func readHiveConnectSessionFromConfig(configPath string) (hiveConnectSession, error) {
+	var session hiveConnectSession
+	cfg, err := appconfig.Load(configPath)
+	if err != nil {
 		return session, err
 	}
-	err = json.Unmarshal(data, &session)
-	return session, err
+	for _, project := range cfg.Projects {
+		for _, platform := range project.Platforms {
+			if !strings.EqualFold(strings.TrimSpace(platform.Type), "hive") {
+				continue
+			}
+			backendURL := hiveOptionString(platform.Options, "backend_url")
+			token := hiveOptionString(platform.Options, "token")
+			if backendURL == "" || token == "" {
+				continue
+			}
+			return hiveConnectSession{
+				BackendURL:  backendURL,
+				APIPrefix:   firstHiveNonEmpty(hiveOptionString(platform.Options, "api_prefix"), hiveConnectAPIPrefix),
+				Token:       token,
+				AgentType:   project.Agent.Type,
+				ProjectName: project.Name,
+				WorkDir:     hiveOptionString(project.Agent.Options, "work_dir"),
+				RuntimeKind: firstHiveNonEmpty(hiveOptionString(platform.Options, "runtime_kind"), project.Agent.Type, hiveConnectClientKind),
+				DeviceName:  hiveOptionString(platform.Options, "device_name"),
+			}, nil
+		}
+	}
+	return session, fmt.Errorf("Hive Connect config has no Hive platform with backend_url and token")
+}
+
+func hiveOptionString(options map[string]any, key string) string {
+	if options == nil {
+		return ""
+	}
+	value, ok := options[key]
+	if !ok || value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
 }
 
 func hiveAPIURL(baseURL string, apiPrefix string, endpoint string) (string, error) {

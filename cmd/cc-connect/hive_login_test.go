@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -82,5 +84,52 @@ func TestRenderHiveConnectConfigUsesHivePlatformOnly(t *testing.T) {
 	}
 	if strings.Contains(cfg, "feishu") || strings.Contains(cfg, "telegram") || strings.Contains(cfg, "slack") {
 		t.Fatalf("config should only include Hive platform:\n%s", cfg)
+	}
+}
+
+func TestReadHiveConnectSessionFallsBackToConfigToml(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	workDir := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Dir(defaultHiveConnectConfigPath()), 0o700); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	configText := renderHiveConnectConfig(hiveLoginConfig{
+		ProjectName: "codex-on-mac",
+		AgentType:   "codex",
+		WorkDir:     workDir,
+		BackendURL:  "https://backend.example",
+		APIPrefix:   "/api",
+		Token:       "hb_secret",
+		RuntimeKind: "codex",
+		DeviceName:  "Rocky Mac",
+		DataDir:     filepath.Join(home, ".hive-connect", "data"),
+	})
+	if err := os.WriteFile(defaultHiveConnectConfigPath(), []byte(configText), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	session, err := readHiveConnectSession()
+	if err != nil {
+		t.Fatalf("readHiveConnectSession() error = %v", err)
+	}
+	if session.BackendURL != "https://backend.example" {
+		t.Fatalf("BackendURL = %q", session.BackendURL)
+	}
+	if session.APIPrefix != "/api" {
+		t.Fatalf("APIPrefix = %q", session.APIPrefix)
+	}
+	if session.Token != "hb_secret" {
+		t.Fatalf("Token = %q", session.Token)
+	}
+	if session.ProjectName != "codex-on-mac" {
+		t.Fatalf("ProjectName = %q", session.ProjectName)
+	}
+	if session.WorkDir != workDir {
+		t.Fatalf("WorkDir = %q, want %q", session.WorkDir, workDir)
+	}
+	if session.AgentType != "codex" || session.RuntimeKind != "codex" {
+		t.Fatalf("agent/runtime = %q/%q", session.AgentType, session.RuntimeKind)
 	}
 }
