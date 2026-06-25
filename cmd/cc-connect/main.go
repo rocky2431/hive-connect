@@ -289,7 +289,7 @@ func main() {
 		slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	}
 
-	configFlag := flag.String("config", "", "path to config file (default: ./config.toml or ~/.cc-connect/config.toml)")
+	configFlag := flag.String("config", "", "path to config file (default: ./config.toml or ~/.hive-connect/config.toml)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	observeFlag := flag.Bool("observe", false, "observe native terminal Claude Code sessions and forward to Slack")
 	observeChannel := flag.String("observe-channel", "", "Slack channel ID to forward terminal observations to (requires --observe)")
@@ -347,7 +347,7 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("Created default config at %s\n", configPath)
-		fmt.Println("Please edit this file to add your agent and platform credentials, then run cc-connect again.")
+		fmt.Println("Please edit this file to add your agent and platform credentials, then run hive-connect again.")
 		os.Exit(0)
 	}
 
@@ -363,7 +363,7 @@ func main() {
 	if len(cfg.Projects) == 0 {
 		fmt.Fprintf(os.Stderr, "Error: no projects configured in %s\n", configPath)
 		fmt.Fprintln(os.Stderr, "Add at least one [[project]] section to your config.toml, or run:")
-		fmt.Fprintln(os.Stderr, "  cc-connect init")
+		fmt.Fprintln(os.Stderr, "  hive-connect login")
 		os.Exit(1)
 	}
 
@@ -1495,7 +1495,7 @@ func resolveClaudeProjectDir(workDir string) string {
 }
 
 // resolveConfigPath determines which config file to use.
-// Priority: explicit flag → ./config.toml → ~/.cc-connect/config.toml
+// Priority: explicit flag → ./config.toml → ~/.hive-connect/config.toml
 func resolveConfigPath(explicit string) string {
 	if explicit != "" {
 		return explicit
@@ -1504,7 +1504,7 @@ func resolveConfigPath(explicit string) string {
 		return "config.toml"
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".cc-connect", "config.toml")
+		return filepath.Join(home, ".hive-connect", "config.toml")
 	}
 	return "config.toml"
 }
@@ -1514,8 +1514,8 @@ func bootstrapConfig(path string) error {
 		return err
 	}
 
-	const tmpl = `# cc-connect configuration
-# Docs: https://github.com/chenhg5/cc-connect
+	const tmpl = `# Hive Connect configuration
+# Docs: https://github.com/rocky2431/hive-connect
 
 [log]
 level = "info"
@@ -1542,7 +1542,7 @@ app_id = "your-feishu-app-id"
 app_secret = "your-feishu-app-secret"
 
 # For more platforms (DingTalk, Telegram, Slack, Discord, LINE, WeChat Work)
-# see: https://github.com/chenhg5/cc-connect/blob/main/config.example.toml
+# see: https://github.com/rocky2431/hive-connect/blob/main/config.example.toml
 `
 	return os.WriteFile(path, []byte(tmpl), 0o644)
 }
@@ -1560,7 +1560,7 @@ func printUsage() {
 Hive Connect %s%s
 
   Connect this machine's local AI agent to Hive as a user-scoped IM channel.
-  Default flow: install -> login -> run.
+  Default flow: install -> login -> daemon.
 
   GitHub:  https://github.com/rocky2431/hive-connect
   NPM:     @hiveclaw243/hive-connect
@@ -1569,6 +1569,7 @@ Usage:
   hive-connect login [flags]
   hive-connect run [flags]
   hive-connect status [flags]
+  hive-connect daemon <install|status|logs|restart|stop>
 
 Flags:
   --config <path>    Path to config file
@@ -1578,9 +1579,9 @@ Flags:
 
 Commands:
   login              Browser device-flow login; writes ~/.hive-connect/config.toml
-  run                Start the local Hive runner with the saved Hive config
-  status             Check the saved Hive bridge token
   daemon             Manage the runner as a background service
+  run                Start the local Hive runner in the foreground for debugging
+  status             Check the saved Hive Connect token
   send               Send a message or attachment to an active local session
   sessions           Browse session history
   config             Manage configuration
@@ -1588,9 +1589,9 @@ Commands:
 Examples:
   hive-connect login
   hive-connect login --hive-url https://your-hive.example.com   # self-hosted or test Hive
-  hive-connect run
+  hive-connect daemon install --config ~/.hive-connect/config.toml --force
+  hive-connect daemon status
   hive-connect status
-  hive-connect daemon install --config ~/.hive-connect/config.toml
 
 `, v, updateHint)
 }

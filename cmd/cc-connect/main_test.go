@@ -331,10 +331,16 @@ func TestPrintUsage_ListsHiveConnectCommands(t *testing.T) {
 	if !strings.Contains(out, "hive-connect login --hive-url https://your-hive.example.com") {
 		t.Fatalf("printUsage() output missing self-hosted Hive login example:\n%s", out)
 	}
-	if !strings.Contains(out, "run                Start the local Hive runner with the saved Hive config") {
+	if !strings.Contains(out, "hive-connect daemon install --config ~/.hive-connect/config.toml --force") {
+		t.Fatalf("printUsage() output missing Hive daemon install example:\n%s", out)
+	}
+	if !strings.Contains(out, "daemon             Manage the runner as a background service") {
+		t.Fatalf("printUsage() output missing Hive daemon command:\n%s", out)
+	}
+	if !strings.Contains(out, "run                Start the local Hive runner in the foreground for debugging") {
 		t.Fatalf("printUsage() output missing Hive run command:\n%s", out)
 	}
-	if !strings.Contains(out, "status             Check the saved Hive bridge token") {
+	if !strings.Contains(out, "status             Check the saved Hive Connect token") {
 		t.Fatalf("printUsage() output missing Hive status command:\n%s", out)
 	}
 }

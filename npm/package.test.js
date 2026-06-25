@@ -32,4 +32,7 @@ assert.match(readme, /defaults to Hive production/);
 assert.match(readme, /For self-hosted or test Hive environments/);
 assert.match(readme, /hive-connect login --hive-url https:\/\/your-hive\.example\.com/);
 assert.match(readme, /hive-connect login --hive-web-url https:\/\/your-hive-web\.example\.com --hive-backend-url https:\/\/your-hive-api\.example\.com/);
+assert.match(readme, /hive-connect daemon install --config ~\/\.hive-connect\/config\.toml --force/);
+assert.match(readme, /hive-connect daemon status/);
+assert.match(readme, /For foreground debugging only/);
 assert.doesNotMatch(readme, /cc-connect/);

@@ -17,7 +17,7 @@ import (
 const (
 	DefaultLogMaxSize    = 10 * 1024 * 1024 // 10 MB
 	DefaultLogMaxBackups = 3                // active + .1 + .2 + .3
-	ServiceName          = "cc-connect"
+	ServiceName          = "hive-connect"
 )
 
 type Config struct {
@@ -61,16 +61,16 @@ func NewManager() (Manager, error) {
 
 func DefaultLogFile() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".cc-connect", "logs", "cc-connect.log")
+	return filepath.Join(home, ".hive-connect", "logs", "hive-connect.log")
 }
 
 func DefaultDataDir() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".cc-connect")
+	return filepath.Join(home, ".hive-connect")
 }
 
 // ── Metadata ────────────────────────────────────────────────
-// Stored at ~/.cc-connect/daemon.json so that `logs`, `status`,
+// Stored at ~/.hive-connect/daemon.json so that `logs`, `status`,
 // etc. can locate the log file without parsing service definitions.
 
 type Meta struct {
@@ -269,4 +269,3 @@ func captureConfigEnvPlaceholdersInString(s string, env map[string]string) {
 		}
 	}
 }
-

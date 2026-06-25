@@ -1,6 +1,6 @@
 {
   "name": "@hiveclaw243/hive-connect",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Connect local AI agents to Hive as a user-scoped IM channel",
   "keywords": [
     "hive",

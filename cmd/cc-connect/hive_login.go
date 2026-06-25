@@ -145,7 +145,11 @@ func runHiveLogin(args []string) {
 		fmt.Fprintf(os.Stderr, "Hive Connect login failed: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Hive Connect login complete.\nConfig: %s\nRun:    hive-connect run\nStatus: hive-connect status\n", defaultHiveConnectConfigPath())
+	fmt.Printf(
+		"Hive Connect login complete.\nConfig: %s\nService: hive-connect daemon install --config %s --force\nStatus:  hive-connect daemon status\nDebug:   hive-connect run\n",
+		defaultHiveConnectConfigPath(),
+		defaultHiveConnectConfigPath(),
+	)
 	if session.AgentID != "" {
 		fmt.Printf("Agent:  %s\n", session.AgentID)
 	}

@@ -29,7 +29,16 @@ and runtime traffic on the backend origin:
 hive-connect login --hive-web-url https://your-hive-web.example.com --hive-backend-url https://your-hive-api.example.com
 ```
 
-## Run
+## Keep Hive Connect Online
+
+```bash
+hive-connect daemon install --config ~/.hive-connect/config.toml --force
+hive-connect daemon status
+```
+
+This installs Hive Connect as a background service so the local agent stays reachable after the terminal is closed.
+
+For foreground debugging only:
 
 ```bash
 hive-connect run
