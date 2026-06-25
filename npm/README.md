@@ -38,12 +38,6 @@ hive-connect daemon status
 
 This installs Hive Connect as a background service so the local agent stays reachable after the terminal is closed.
 
-For foreground debugging only:
-
-```bash
-hive-connect run
-```
-
 ## Check Status
 
 ```bash

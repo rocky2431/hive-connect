@@ -13,6 +13,7 @@ const runJs = fs.readFileSync(path.join(root, "run.js"), "utf8");
 const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
 
 assert.strictEqual(pkg.name, "@hiveclaw243/hive-connect");
+assert.strictEqual(pkg.version, "0.1.6");
 assert.deepStrictEqual(pkg.bin, { "hive-connect": "run.js" });
 assert.strictEqual(pkg.repository.url, "git+https://github.com/rocky2431/hive-connect.git");
 
@@ -34,5 +35,7 @@ assert.match(readme, /hive-connect login --hive-url https:\/\/your-hive\.example
 assert.match(readme, /hive-connect login --hive-web-url https:\/\/your-hive-web\.example\.com --hive-backend-url https:\/\/your-hive-api\.example\.com/);
 assert.match(readme, /hive-connect daemon install --config ~\/\.hive-connect\/config\.toml --force/);
 assert.match(readme, /hive-connect daemon status/);
-assert.match(readme, /For foreground debugging only/);
+assert.match(readme, /background service/);
+assert.doesNotMatch(readme, /For foreground debugging only/);
+assert.doesNotMatch(readme, /hive-connect run/);
 assert.doesNotMatch(readme, /cc-connect/);
