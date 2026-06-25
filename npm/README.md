@@ -22,6 +22,13 @@ For self-hosted or test Hive environments, override the Hive origin:
 hive-connect login --hive-url https://your-hive.example.com
 ```
 
+For split web/backend deployments, keep browser authentication on the web origin
+and runtime traffic on the backend origin:
+
+```bash
+hive-connect login --hive-web-url https://your-hive-web.example.com --hive-backend-url https://your-hive-api.example.com
+```
+
 ## Run
 
 ```bash

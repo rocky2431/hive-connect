@@ -15,9 +15,43 @@ func TestHiveAPIURLBuildsPrefixedEndpoint(t *testing.T) {
 	}
 }
 
-func TestDefaultHiveURLUsesProductionWebOrigin(t *testing.T) {
-	if defaultHiveURL != "https://frontend-production-0346.up.railway.app" {
-		t.Fatalf("defaultHiveURL = %q", defaultHiveURL)
+func TestDefaultHiveURLsSplitWebActivationAndBackendRuntime(t *testing.T) {
+	if defaultHiveWebURL != "https://frontend-production-0346.up.railway.app" {
+		t.Fatalf("defaultHiveWebURL = %q", defaultHiveWebURL)
+	}
+	if defaultHiveBackendURL != "https://backend-production-326d.up.railway.app" {
+		t.Fatalf("defaultHiveBackendURL = %q", defaultHiveBackendURL)
+	}
+}
+
+func TestResolveHiveLoginOriginsDefaultsToWebFrontendAndBackendAPI(t *testing.T) {
+	origins := resolveHiveLoginOrigins("", "", "")
+	if origins.WebURL != defaultHiveWebURL {
+		t.Fatalf("WebURL = %q", origins.WebURL)
+	}
+	if origins.BackendURL != defaultHiveBackendURL {
+		t.Fatalf("BackendURL = %q", origins.BackendURL)
+	}
+}
+
+func TestResolveHiveLoginOriginsLegacyURLOverridesBoth(t *testing.T) {
+	origins := resolveHiveLoginOrigins("https://hive.example", "https://web.example", "https://api.example")
+	if origins.WebURL != "https://hive.example" || origins.BackendURL != "https://hive.example" {
+		t.Fatalf("origins = %#v", origins)
+	}
+}
+
+func TestHiveVerificationURLUsesConfiguredWebOrigin(t *testing.T) {
+	got := hiveVerificationURL(
+		hivePairingInitResponse{
+			UserCode:                "HIVE-ABCD-1234",
+			VerificationURIComplete: "https://backend.example/local-bridge/activate?user_code=HIVE-ABCD-1234",
+		},
+		"https://frontend.example/",
+	)
+	want := "https://frontend.example/local-bridge/activate?user_code=HIVE-ABCD-1234"
+	if got != want {
+		t.Fatalf("verification url = %q, want %q", got, want)
 	}
 }
 

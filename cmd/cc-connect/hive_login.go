@@ -22,13 +22,15 @@ import (
 const (
 	hiveConnectClientKind = "hive-connect"
 	hiveConnectAPIPrefix  = "/api"
-	defaultHiveURL        = "https://frontend-production-0346.up.railway.app"
+	defaultHiveWebURL     = "https://frontend-production-0346.up.railway.app"
+	defaultHiveBackendURL = "https://backend-production-326d.up.railway.app"
 )
 
 type hiveLoginConfig struct {
 	ProjectName string
 	AgentType   string
 	WorkDir     string
+	WebURL      string
 	BackendURL  string
 	APIPrefix   string
 	Token       string
@@ -51,6 +53,11 @@ type hiveConnectSession struct {
 	TenantID     string `json:"tenant_id,omitempty"`
 	UserID       string `json:"user_id,omitempty"`
 	UpdatedAt    string `json:"updated_at"`
+}
+
+type hiveLoginOrigins struct {
+	WebURL     string
+	BackendURL string
 }
 
 type hivePairingInitResponse struct {
@@ -104,9 +111,11 @@ func runHiveLogin(args []string) {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
 	hiveURL := fs.String(
 		"hive-url",
-		firstHiveNonEmpty(os.Getenv("HIVE_BACKEND_URL"), os.Getenv("HIVE_URL"), defaultHiveURL),
-		"Override Hive web or backend origin for self-hosted or test environments",
+		"",
+		"Override both Hive web and backend origins for self-hosted or single-origin test environments",
 	)
+	hiveWebURL := fs.String("hive-web-url", firstHiveNonEmpty(os.Getenv("HIVE_WEB_URL"), os.Getenv("HIVE_URL"), defaultHiveWebURL), "Hive web origin used for browser authentication")
+	hiveBackendURL := fs.String("hive-backend-url", firstHiveNonEmpty(os.Getenv("HIVE_BACKEND_URL"), os.Getenv("HIVE_URL"), defaultHiveBackendURL), "Hive backend origin used for API and WebSocket runtime")
 	apiPrefix := fs.String("api-prefix", firstHiveNonEmpty(os.Getenv("HIVE_API_PREFIX"), hiveConnectAPIPrefix), "Hive API prefix")
 	agentType := fs.String("agent", firstHiveNonEmpty(os.Getenv("HIVE_AGENT_TYPE"), "codex"), "Local agent runtime type: codex, claudecode, cursor, gemini, opencode, qoder, iflow")
 	workDir := fs.String("work-dir", defaultHiveWorkDir(), "Workspace directory passed to the local agent")
@@ -119,12 +128,14 @@ func runHiveLogin(args []string) {
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(args)
+	origins := resolveHiveLoginOrigins(*hiveURL, *hiveWebURL, *hiveBackendURL)
 
 	session, err := performHiveLogin(context.Background(), hiveLoginConfig{
 		ProjectName: firstHiveNonEmpty(*projectName, defaultHiveProjectName(*agentType, *deviceName)),
 		AgentType:   strings.TrimSpace(*agentType),
 		WorkDir:     strings.TrimSpace(*workDir),
-		BackendURL:  strings.TrimRight(strings.TrimSpace(*hiveURL), "/"),
+		WebURL:      origins.WebURL,
+		BackendURL:  origins.BackendURL,
 		APIPrefix:   normalizeHiveAPIPrefix(*apiPrefix),
 		RuntimeKind: firstHiveNonEmpty(strings.TrimSpace(*agentType), hiveConnectClientKind),
 		DeviceName:  strings.TrimSpace(*deviceName),
@@ -210,10 +221,11 @@ func performHiveLogin(ctx context.Context, cfg hiveLoginConfig, noBrowser bool, 
 		return hiveConnectSession{}, fmt.Errorf("pairing init response missing device_code or verification_uri_complete")
 	}
 
-	fmt.Printf("Opening Hive authentication page:\n  %s\n", initOut.VerificationURIComplete)
+	verificationURL := hiveVerificationURL(initOut, cfg.WebURL)
+	fmt.Printf("Opening Hive authentication page:\n  %s\n", verificationURL)
 	if noBrowser {
 		fmt.Println("Browser auto-open disabled. Open the URL above to approve this local agent.")
-	} else if err := openBrowser(initOut.VerificationURIComplete); err != nil {
+	} else if err := openBrowser(verificationURL); err != nil {
 		fmt.Printf("Could not open browser automatically: %v\nOpen the URL above manually.\n", err)
 	}
 
@@ -374,6 +386,33 @@ func hiveAPIURL(baseURL string, apiPrefix string, endpoint string) (string, erro
 	}
 	u.Path = path.Join(u.Path, normalizeHiveAPIPrefix(apiPrefix), endpoint)
 	return u.String(), nil
+}
+
+func resolveHiveLoginOrigins(hiveURL string, webURL string, backendURL string) hiveLoginOrigins {
+	legacy := strings.TrimRight(strings.TrimSpace(hiveURL), "/")
+	if legacy != "" {
+		return hiveLoginOrigins{WebURL: legacy, BackendURL: legacy}
+	}
+	web := strings.TrimRight(firstHiveNonEmpty(webURL, defaultHiveWebURL), "/")
+	backend := strings.TrimRight(firstHiveNonEmpty(backendURL, defaultHiveBackendURL), "/")
+	return hiveLoginOrigins{WebURL: web, BackendURL: backend}
+}
+
+func hiveVerificationURL(initOut hivePairingInitResponse, webURL string) string {
+	webURL = strings.TrimRight(strings.TrimSpace(webURL), "/")
+	if webURL == "" || strings.TrimSpace(initOut.UserCode) == "" {
+		return initOut.VerificationURIComplete
+	}
+	u, err := url.Parse(webURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return initOut.VerificationURIComplete
+	}
+	u.Path = path.Join(u.Path, "/local-bridge/activate")
+	u.RawQuery = ""
+	q := u.Query()
+	q.Set("user_code", strings.TrimSpace(initOut.UserCode))
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func normalizeHiveAPIPrefix(value string) string {
