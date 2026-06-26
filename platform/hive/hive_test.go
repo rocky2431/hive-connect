@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -243,5 +245,99 @@ func TestPlatformWebSocketRoundTrip(t *testing.T) {
 	}
 	if text := strings.TrimSpace(payload["text"].(string)); text != "hello from local" {
 		t.Fatalf("payload text = %q", text)
+	}
+}
+
+func TestPlatformReconnectsAfterServerClose(t *testing.T) {
+	var ticketCount atomic.Int32
+	var wsCount atomic.Int32
+	reconnected := make(chan struct{})
+
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/local-bridge/channel/ws-ticket":
+			ticket := fmt.Sprintf("HIVE_WS_%d", ticketCount.Add(1))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ticket":     ticket,
+				"expires_in": 60,
+				"single_use": true,
+			})
+		case "/api/local-bridge/channel/ws":
+			n := wsCount.Add(1)
+			if got, want := r.URL.Query().Get("ticket"), fmt.Sprintf("HIVE_WS_%d", n); got != want {
+				t.Fatalf("ticket = %q, want %q", got, want)
+			}
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Fatalf("upgrade: %v", err)
+			}
+			defer conn.Close()
+			if err := conn.WriteJSON(map[string]any{"type": "hello", "connection_id": "conn-1", "owner_user_id": "owner-1"}); err != nil {
+				t.Fatalf("write hello: %v", err)
+			}
+			var readyFrame map[string]any
+			if err := conn.ReadJSON(&readyFrame); err != nil {
+				t.Fatalf("read ready: %v", err)
+			}
+			if n == 1 {
+				_ = conn.WriteControl(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseServiceRestart, "restart"),
+					time.Now().Add(time.Second),
+				)
+				return
+			}
+			if err := conn.WriteJSON(map[string]any{
+				"type": "message",
+				"message": map[string]any{
+					"id":            "msg-reconnected",
+					"session_id":    "sess-1",
+					"owner_user_id": "owner-1",
+					"content":       "after reconnect",
+				},
+			}); err != nil {
+				t.Fatalf("write message after reconnect: %v", err)
+			}
+			var ackFrame map[string]any
+			if err := conn.ReadJSON(&ackFrame); err != nil {
+				t.Fatalf("read ack after reconnect: %v", err)
+			}
+			close(reconnected)
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	plat, err := New(map[string]any{
+		"backend_url":  server.URL,
+		"token":        "hb_test",
+		"runtime_kind": "codex",
+	})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	received := make(chan *core.Message, 1)
+	if err := plat.Start(func(p core.Platform, msg *core.Message) {
+		received <- msg
+	}); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	defer plat.Stop()
+
+	select {
+	case msg := <-received:
+		if msg.Content != "after reconnect" {
+			t.Fatalf("message content = %q", msg.Content)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for reconnected message; tickets=%d websockets=%d", ticketCount.Load(), wsCount.Load())
+	}
+	select {
+	case <-reconnected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for reconnect server exchange")
 	}
 }

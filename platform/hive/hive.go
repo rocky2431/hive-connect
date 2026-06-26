@@ -26,6 +26,8 @@ const (
 	defaultRuntimeKind  = "hive-connect"
 	hiveUserAgent       = "hive-connect"
 	wsPingInterval      = 25 * time.Second
+	reconnectInitial    = time.Second
+	reconnectMax        = 30 * time.Second
 	httpRequestTimeout  = 30 * time.Second
 	maxInlineAttachment = 8 * 1024 * 1024
 )
@@ -49,6 +51,7 @@ type Platform struct {
 	handler core.MessageHandler
 	ctx     context.Context
 	cancel  context.CancelFunc
+	life    core.PlatformLifecycleHandler
 
 	connMu sync.Mutex
 	conn   *websocket.Conn
@@ -147,18 +150,17 @@ func New(opts map[string]any) (core.Platform, error) {
 
 func (p *Platform) Name() string { return "hive" }
 
+func (p *Platform) SetLifecycleHandler(h core.PlatformLifecycleHandler) {
+	p.life = h
+}
+
 func (p *Platform) Start(handler core.MessageHandler) error {
 	p.handler = handler
 	ctx, cancel := context.WithCancel(context.Background())
 	p.ctx = ctx
 	p.cancel = cancel
 
-	if err := p.connect(ctx); err != nil {
-		cancel()
-		return err
-	}
-	go p.readLoop(ctx)
-	go p.pingLoop(ctx)
+	go p.reconnectLoop(ctx)
 	return nil
 }
 
@@ -166,6 +168,10 @@ func (p *Platform) Stop() error {
 	if p.cancel != nil {
 		p.cancel()
 	}
+	return p.closeConn()
+}
+
+func (p *Platform) closeConn() error {
 	p.connMu.Lock()
 	defer p.connMu.Unlock()
 	if p.conn == nil {
@@ -256,6 +262,90 @@ func (p *Platform) connect(ctx context.Context) error {
 	})
 }
 
+func (p *Platform) reconnectLoop(ctx context.Context) {
+	delay := reconnectInitial
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := p.connect(ctx); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			p.notifyUnavailable(err)
+			slog.Warn("hive: websocket connect failed, retrying", "error", err, "backoff", delay)
+			if !sleepContext(ctx, delay) {
+				return
+			}
+			delay = nextReconnectDelay(delay)
+			continue
+		}
+
+		delay = reconnectInitial
+		p.notifyReady()
+		err := p.serveConnected(ctx)
+		_ = p.closeConn()
+		if ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			err = fmt.Errorf("hive: websocket disconnected")
+		}
+		p.notifyUnavailable(err)
+		slog.Warn("hive: websocket disconnected, reconnecting", "error", err, "backoff", delay)
+		if !sleepContext(ctx, delay) {
+			return
+		}
+		delay = nextReconnectDelay(delay)
+	}
+}
+
+func (p *Platform) serveConnected(ctx context.Context) error {
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errCh := make(chan error, 2)
+	go func() { errCh <- p.readLoop(connCtx) }()
+	go func() { errCh <- p.pingLoop(connCtx) }()
+	err := <-errCh
+	cancel()
+	_ = p.closeConn()
+	return err
+}
+
+func (p *Platform) notifyReady() {
+	if p.life != nil {
+		p.life.OnPlatformReady(p)
+	}
+}
+
+func (p *Platform) notifyUnavailable(err error) {
+	if p.life != nil {
+		p.life.OnPlatformUnavailable(p, err)
+	}
+}
+
+func nextReconnectDelay(current time.Duration) time.Duration {
+	if current <= 0 {
+		return reconnectInitial
+	}
+	next := current * 2
+	if next > reconnectMax {
+		return reconnectMax
+	}
+	return next
+}
+
+func sleepContext(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 func (p *Platform) createWSTicket(ctx context.Context) (string, error) {
 	ticketURL, err := p.apiURL("/local-bridge/channel/ws-ticket")
 	if err != nil {
@@ -288,41 +378,41 @@ func (p *Platform) createWSTicket(ctx context.Context) (string, error) {
 	return out.Ticket, nil
 }
 
-func (p *Platform) readLoop(ctx context.Context) {
+func (p *Platform) readLoop(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		default:
 		}
 		p.connMu.Lock()
 		conn := p.conn
 		p.connMu.Unlock()
 		if conn == nil {
-			return
+			return fmt.Errorf("hive: websocket is not connected")
 		}
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			if ctx.Err() == nil {
 				slog.Warn("hive: websocket read stopped", "error", err)
 			}
-			return
+			return err
 		}
 		p.handleFrame(raw)
 	}
 }
 
-func (p *Platform) pingLoop(ctx context.Context) {
+func (p *Platform) pingLoop(ctx context.Context) error {
 	ticker := time.NewTicker(wsPingInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-ticker.C:
 			if err := p.writeJSON(map[string]any{"type": "ping"}); err != nil {
 				slog.Debug("hive: ping failed", "error", err)
-				return
+				return err
 			}
 		}
 	}
