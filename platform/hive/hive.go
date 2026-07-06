@@ -183,9 +183,22 @@ func (p *Platform) closeConn() error {
 }
 
 func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
-	return p.sendEvent(ctx, rctx, "text", map[string]any{
-		"text":    content,
-		"content": content,
+	rc, err := replyContextFromAny(rctx)
+	if err != nil {
+		return err
+	}
+	if rc.MessageID == "" {
+		return p.sendEvent(ctx, rc, "text", map[string]any{
+			"text":    content,
+			"content": content,
+		})
+	}
+	return p.writeJSONWithContext(ctx, map[string]any{
+		"type":       "result",
+		"session_id": rc.SessionID,
+		"message_id": rc.MessageID,
+		"status":     "completed",
+		"output":     content,
 	})
 }
 

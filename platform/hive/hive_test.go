@@ -136,7 +136,7 @@ func TestCoreMessageFromHivePayload(t *testing.T) {
 func TestPlatformWebSocketRoundTrip(t *testing.T) {
 	var readyFrame map[string]any
 	var ackFrame map[string]any
-	var eventFrame map[string]any
+	var resultFrame map[string]any
 	serverDone := make(chan struct{})
 
 	upgrader := websocket.Upgrader{}
@@ -183,8 +183,8 @@ func TestPlatformWebSocketRoundTrip(t *testing.T) {
 			if err := conn.ReadJSON(&ackFrame); err != nil {
 				t.Fatalf("read ack: %v", err)
 			}
-			if err := conn.ReadJSON(&eventFrame); err != nil {
-				t.Fatalf("read event: %v", err)
+			if err := conn.ReadJSON(&resultFrame); err != nil {
+				t.Fatalf("read result: %v", err)
 			}
 			close(serverDone)
 		default:
@@ -236,15 +236,17 @@ func TestPlatformWebSocketRoundTrip(t *testing.T) {
 	if ackFrame["type"] != "ack" || ackFrame["message_id"] != "msg-1" {
 		t.Fatalf("ackFrame = %#v", ackFrame)
 	}
-	if eventFrame["type"] != "event" || eventFrame["event_type"] != "text" {
-		t.Fatalf("eventFrame = %#v", eventFrame)
+	if resultFrame["type"] != "result" {
+		t.Fatalf("resultFrame = %#v", resultFrame)
 	}
-	payload, ok := eventFrame["payload"].(map[string]any)
-	if !ok {
-		t.Fatalf("payload type = %T", eventFrame["payload"])
+	if resultFrame["session_id"] != "sess-1" || resultFrame["message_id"] != "msg-1" {
+		t.Fatalf("resultFrame identifiers = %#v", resultFrame)
 	}
-	if text := strings.TrimSpace(payload["text"].(string)); text != "hello from local" {
-		t.Fatalf("payload text = %q", text)
+	if resultFrame["status"] != "completed" {
+		t.Fatalf("resultFrame status = %#v", resultFrame["status"])
+	}
+	if text := strings.TrimSpace(resultFrame["output"].(string)); text != "hello from local" {
+		t.Fatalf("resultFrame output = %q", text)
 	}
 }
 

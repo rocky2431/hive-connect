@@ -13,7 +13,7 @@ const runJs = fs.readFileSync(path.join(root, "run.js"), "utf8");
 const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
 
 assert.strictEqual(pkg.name, "@hiveclaw243/hive-connect");
-assert.strictEqual(pkg.version, "0.1.6");
+assert.strictEqual(pkg.version, "0.1.8");
 assert.deepStrictEqual(pkg.bin, { "hive-connect": "run.js" });
 assert.strictEqual(pkg.repository.url, "git+https://github.com/rocky2431/hive-connect.git");
 
