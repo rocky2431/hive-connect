@@ -19,6 +19,8 @@ import (
 	"github.com/chenhg5/cc-connect/core"
 )
 
+const opencodeModelRefreshTimeout = 10 * time.Second
+
 func init() {
 	core.RegisterAgent("opencode", New)
 }
@@ -35,13 +37,15 @@ type Agent struct {
 	cmd                  string   // CLI binary name, default "opencode"
 	cliExtraArgs         []string // extra args from cmd after the binary name
 	configEnv            []string // env vars from [projects.agent.options.env]
-	agentName            string // passed as --agent to opencode (for plugin-defined agents)
+	agentName            string   // passed as --agent to opencode (for plugin-defined agents)
 	providers            []core.ProviderConfig
 	activeIdx            int
 	sessionEnv           []string
 	modelCachePath       string
 	persistentModelCache *opencodePersistentModelCache
 	refreshingModelCache bool
+	stopped              bool
+	refreshCancel        context.CancelFunc
 	refreshWg            sync.WaitGroup // tracks in-flight background model-cache refresh goroutines
 	mu                   sync.RWMutex
 }
@@ -341,24 +345,25 @@ func (a *Agent) persistentModels() []core.ModelOption {
 func (a *Agent) startPersistentModelRefresh(snapshot opencodeModelDiscoverySnapshot, allowColdStart bool) {
 	a.mu.Lock()
 	hasPersistentModels := a.persistentModelCache != nil && len(a.persistentModelCache.Models) > 0
-	if (!allowColdStart && !hasPersistentModels) || a.refreshingModelCache {
+	if a.stopped || (!allowColdStart && !hasPersistentModels) || a.refreshingModelCache {
 		a.mu.Unlock()
 		return
 	}
 	a.refreshingModelCache = true
+	ctx, cancel := context.WithTimeout(context.Background(), opencodeModelRefreshTimeout)
+	a.refreshCancel = cancel
 	a.refreshWg.Add(1)
 	a.mu.Unlock()
 
 	go func() {
-		defer a.refreshWg.Done()
 		defer func() {
+			cancel()
 			a.mu.Lock()
 			a.refreshingModelCache = false
+			a.refreshCancel = nil
 			a.mu.Unlock()
+			a.refreshWg.Done()
 		}()
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
 
 		models := a.discoverModelsWithSnapshot(ctx, snapshot)
 		if len(models) == 0 {
@@ -490,7 +495,17 @@ func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error)
 	return listOpencodeSessions(cmd, workDir)
 }
 
-func (a *Agent) Stop() error { return nil }
+func (a *Agent) Stop() error {
+	a.mu.Lock()
+	a.stopped = true
+	cancel := a.refreshCancel
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	a.refreshWg.Wait()
+	return nil
+}
 
 // DeleteSession implements core.SessionDeleter via `opencode session delete <id>`.
 func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {

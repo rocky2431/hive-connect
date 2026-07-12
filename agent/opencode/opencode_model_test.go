@@ -21,30 +21,86 @@ func (errWriter) Write(_ []byte) (int, error) {
 	return 0, errors.New("write failed")
 }
 
-// writeFakeModelsBin writes a temporary shell script that acts as a fake CLI.
-// When invoked with "models", it prints lines to stdout.
-// When exitCode != 0, the script exits immediately with that code.
-func writeFakeModelsBin(t *testing.T, lines []string, exitCode int) string {
-	t.Helper()
-	tmpDir := t.TempDir()
-	name := filepath.Join(tmpDir, "fake-opencode")
+const (
+	opencodeModelsHelperEnabled    = "GO_WANT_OPENCODE_MODELS_HELPER"
+	opencodeModelsHelperCountPath  = "OPENCODE_MODELS_HELPER_COUNT_PATH"
+	opencodeModelsHelperGatePath   = "OPENCODE_MODELS_HELPER_GATE_PATH"
+	opencodeModelsHelperLines      = "OPENCODE_MODELS_HELPER_LINES"
+	opencodeModelsHelperRequireEnv = "OPENCODE_MODELS_HELPER_REQUIRE_ENV"
+	opencodeModelsHelperExitCode   = "OPENCODE_MODELS_HELPER_EXIT_CODE"
+)
 
-	var body strings.Builder
-	body.WriteString("#!/bin/sh\n")
-	if exitCode != 0 {
-		fmt.Fprintf(&body, "exit %d\n", exitCode)
-	} else {
-		body.WriteString("if [ \"$1\" = \"models\" ]; then\n")
-		for _, line := range lines {
-			fmt.Fprintf(&body, "printf '%%s\\n' '%s'\n", line)
+func TestMain(m *testing.M) {
+	if os.Getenv(opencodeModelsHelperEnabled) == "1" {
+		os.Exit(runOpenCodeModelsHelper())
+	}
+	os.Exit(m.Run())
+}
+
+func runOpenCodeModelsHelper() int {
+	if len(os.Args) < 2 || os.Args[len(os.Args)-1] != "models" {
+		return 0
+	}
+	countPath := os.Getenv(opencodeModelsHelperCountPath)
+	if countPath != "" {
+		count := 0
+		if data, err := os.ReadFile(countPath); err == nil {
+			_, _ = fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &count)
 		}
-		body.WriteString("fi\n")
+		if err := os.WriteFile(countPath, []byte(fmt.Sprintf("%d", count+1)), 0o644); err != nil {
+			return 2
+		}
 	}
+	gatePath := os.Getenv(opencodeModelsHelperGatePath)
+	if gatePath != "" {
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			if _, err := os.Stat(gatePath); err == nil {
+				break
+			}
+			<-ticker.C
+		}
+	}
+	if required := os.Getenv(opencodeModelsHelperRequireEnv); required != "" && os.Getenv(required) == "" {
+		return 0
+	}
+	exitCode := 0
+	_, _ = fmt.Sscanf(os.Getenv(opencodeModelsHelperExitCode), "%d", &exitCode)
+	if exitCode != 0 {
+		return exitCode
+	}
+	var lines []string
+	if err := json.Unmarshal([]byte(os.Getenv(opencodeModelsHelperLines)), &lines); err != nil {
+		return 2
+	}
+	for _, line := range lines {
+		fmt.Println(line)
+	}
+	return 0
+}
 
-	if err := os.WriteFile(name, []byte(body.String()), 0755); err != nil {
-		t.Fatal(err)
+// configureModelsHelper keeps the real child-process boundary while avoiding
+// shell/cat/sleep process storms when repository packages run concurrently.
+// Test Double rationale: OpenCode CLI model discovery is outside this repo;
+// this test binary implements only its deterministic `models` stdout contract.
+func configureModelsHelper(t *testing.T, countPath, gatePath string, lines []string, requireEnvKey string, exitCode int) string {
+	t.Helper()
+	encodedLines, err := json.Marshal(lines)
+	if err != nil {
+		t.Fatalf("encode helper lines: %v", err)
 	}
-	return name
+	t.Setenv(opencodeModelsHelperEnabled, "1")
+	t.Setenv(opencodeModelsHelperCountPath, countPath)
+	t.Setenv(opencodeModelsHelperGatePath, gatePath)
+	t.Setenv(opencodeModelsHelperLines, string(encodedLines))
+	t.Setenv(opencodeModelsHelperRequireEnv, requireEnvKey)
+	t.Setenv(opencodeModelsHelperExitCode, fmt.Sprintf("%d", exitCode))
+	return os.Args[0]
+}
+
+func writeFakeModelsBin(t *testing.T, lines []string, exitCode int) string {
+	return configureModelsHelper(t, "", "", lines, "", exitCode)
 }
 
 func TestWriteProviderSignaturePart_PropagatesWriterError(t *testing.T) {
@@ -111,106 +167,72 @@ func writePersistentModelCacheWithSnapshot(t *testing.T, cachePath string, snaps
 }
 
 func writeBlockingModelsBin(t *testing.T, gatePath string, lines []string) string {
-	t.Helper()
-	tmpDir := t.TempDir()
-	name := filepath.Join(tmpDir, "fake-opencode")
-
-	var body strings.Builder
-	body.WriteString("#!/bin/sh\n")
-	body.WriteString("if [ \"$1\" = \"models\" ]; then\n")
-	if gatePath != "" {
-		fmt.Fprintf(&body, "  while [ ! -f '%s' ]; do\n", gatePath)
-		body.WriteString("    sleep 0.01\n")
-		body.WriteString("  done\n")
-	}
-	for _, line := range lines {
-		fmt.Fprintf(&body, "  printf '%%s\\n' '%s'\n", line)
-	}
-	body.WriteString("fi\n")
-
-	if err := os.WriteFile(name, []byte(body.String()), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	return name
+	return configureModelsHelper(t, "", gatePath, lines, "", 0)
 }
 
 func writeCountingModelsBin(t *testing.T, countPath, gatePath string, lines []string, requireEnvKey string, exitCode int) string {
-	t.Helper()
-	tmpDir := t.TempDir()
-	name := filepath.Join(tmpDir, "fake-opencode")
-
-	var body strings.Builder
-	body.WriteString("#!/bin/sh\n")
-	body.WriteString("if [ \"$1\" = \"models\" ]; then\n")
-	if countPath != "" {
-		fmt.Fprintf(&body, "  count=0\n  if [ -f '%s' ]; then count=$(cat '%s'); fi\n", countPath, countPath)
-		fmt.Fprintf(&body, "  count=$((count + 1))\n  printf '%%s' \"$count\" > '%s'\n", countPath)
-	}
-	if gatePath != "" {
-		fmt.Fprintf(&body, "  while [ ! -f '%s' ]; do\n", gatePath)
-		body.WriteString("    sleep 0.01\n")
-		body.WriteString("  done\n")
-	}
-	if requireEnvKey != "" {
-		fmt.Fprintf(&body, "  if [ -z \"$%s\" ]; then exit 0; fi\n", requireEnvKey)
-	}
-	if exitCode != 0 {
-		fmt.Fprintf(&body, "  exit %d\n", exitCode)
-	} else {
-		for _, line := range lines {
-			fmt.Fprintf(&body, "  printf '%%s\\n' '%s'\n", line)
-		}
-	}
-	body.WriteString("fi\n")
-
-	if err := os.WriteFile(name, []byte(body.String()), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	return name
+	return configureModelsHelper(t, countPath, gatePath, lines, requireEnvKey, exitCode)
 }
 
-func waitForModelsInPersistentCache(t *testing.T, cachePath string, want []string) {
+func assertPersistentModels(t *testing.T, cachePath string, want []string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		cache, err := loadOpencodePersistentModelCache(cachePath)
-		if err == nil && cache != nil && len(cache.Models) == len(want) {
-			match := true
-			for i, model := range cache.Models {
-				if model.Name != want[i] {
-					match = false
-					break
-				}
-			}
-			if match {
-				return
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
 	cache, err := loadOpencodePersistentModelCache(cachePath)
 	if err != nil {
 		t.Fatalf("loadOpencodePersistentModelCache(%q) error = %v", cachePath, err)
 	}
-	t.Fatalf("persistent cache models = %v, want %v", cache, want)
+	if cache == nil || len(cache.Models) != len(want) {
+		t.Fatalf("persistent cache models = %v, want %v", cache, want)
+	}
+	for index, model := range cache.Models {
+		if model.Name != want[index] {
+			t.Fatalf("persistent cache models = %v, want %v", cache.Models, want)
+		}
+	}
 }
 
-func waitForFileContent(t *testing.T, path, want string) {
+func assertFileContent(t *testing.T, path, want string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(path)
-		if err == nil && strings.TrimSpace(string(data)) == want {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("os.ReadFile(%q) error = %v", path, err)
 	}
-	t.Fatalf("file %q content = %q, want %q", path, strings.TrimSpace(string(data)), want)
+	if got := strings.TrimSpace(string(data)); got != want {
+		t.Fatalf("file %q content = %q, want %q", path, got, want)
+	}
+}
+
+func waitForHelperFileContent(t *testing.T, path, want string) {
+	t.Helper()
+	deadline := time.Now().Add(opencodeModelRefreshTimeout)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil && strings.TrimSpace(string(data)) == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("helper marker %q did not reach %q within model refresh timeout", path, want)
+		}
+		<-ticker.C
+	}
+}
+
+func registerModelRefreshCleanup(t *testing.T, a *Agent) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := a.Stop(); err != nil {
+			t.Errorf("Stop() cleanup error = %v", err)
+		}
+	})
+}
+
+func releaseAndJoinModelRefresh(t *testing.T, a *Agent, gatePath string) {
+	t.Helper()
+	if err := os.WriteFile(gatePath, []byte("ok"), 0o644); err != nil {
+		t.Fatalf("release model refresh gate %q: %v", gatePath, err)
+	}
+	a.refreshWg.Wait()
 }
 
 func readPersistentModelCachePayload(t *testing.T, cachePath string) map[string]any {
@@ -635,6 +657,8 @@ func TestNew_SurfacesPersistentModelCacheViaAvailableModels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	a := agent.(*Agent)
+	registerModelRefreshCleanup(t, a)
 	switcher, ok := agent.(core.ModelSwitcher)
 	if !ok {
 		t.Fatalf("New() agent does not implement core.ModelSwitcher")
@@ -661,12 +685,7 @@ func TestAvailableModels_PrefersPersistentCacheOverDiscoveredModels(t *testing.T
 		t.Fatalf("New() error = %v", err)
 	}
 	a := agent.(*Agent)
-	// AvailableModels with a cached result launches a background refresh goroutine that
-	// writes into dataDir. Register cleanup BEFORE calling AvailableModels so that
-	// t.Cleanup runs in LIFO order: our Wait() fires first, then t.TempDir's RemoveAll.
-	// Without this, the goroutine can still be writing when RemoveAll runs, causing
-	// "TempDir RemoveAll cleanup: directory not empty" under -cover (see #1118).
-	t.Cleanup(func() { a.refreshWg.Wait() })
+	registerModelRefreshCleanup(t, a)
 
 	switcher, ok := agent.(core.ModelSwitcher)
 	if !ok {
@@ -693,6 +712,8 @@ func TestAvailableModels_ReturnsPersistentCacheWhenDiscoveryFails(t *testing.T) 
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	a := agent.(*Agent)
+	registerModelRefreshCleanup(t, a)
 	switcher, ok := agent.(core.ModelSwitcher)
 	if !ok {
 		t.Fatalf("New() agent does not implement core.ModelSwitcher")
@@ -756,6 +777,8 @@ func TestAvailableModels_BackgroundRefreshUpdatesDiskCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
+	a := agent.(*Agent)
+	registerModelRefreshCleanup(t, a)
 	switcher, ok := agent.(core.ModelSwitcher)
 	if !ok {
 		t.Fatalf("New() agent does not implement core.ModelSwitcher")
@@ -766,11 +789,7 @@ func TestAvailableModels_BackgroundRefreshUpdatesDiskCache(t *testing.T) {
 		t.Fatalf("AvailableModels() = %v, want immediate cached result", got)
 	}
 
-	if err := os.WriteFile(gatePath, []byte("ok"), 0o644); err != nil {
-		t.Fatalf("os.WriteFile(%q) error = %v", gatePath, err)
-	}
-
-	waitForModelsInPersistentCache(t, cachePath, []string{"fresh/model", "second/model"})
+	releaseAndJoinModelRefresh(t, a, gatePath)
 
 	got = switcher.AvailableModels(context.Background())
 	if len(got) != 2 || got[0].Name != "fresh/model" || got[1].Name != "second/model" {
@@ -795,15 +814,14 @@ func TestAvailableModels_BackgroundRefreshFailurePreservesCache(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 	a := agent.(*Agent)
+	registerModelRefreshCleanup(t, a)
 
 	got := a.AvailableModels(context.Background())
 	if len(got) != 1 || got[0].Name != "cached/model" {
 		t.Fatalf("AvailableModels() = %v, want immediate cached result", got)
 	}
-	if err := os.WriteFile(gatePath, []byte("ok"), 0o644); err != nil {
-		t.Fatalf("os.WriteFile(%q) error = %v", gatePath, err)
-	}
-	waitForFileContent(t, countPath, "1")
+	releaseAndJoinModelRefresh(t, a, gatePath)
+	assertFileContent(t, countPath, "1")
 
 	cache, err := loadOpencodePersistentModelCache(cachePath)
 	if err != nil {
@@ -835,6 +853,7 @@ func TestAvailableModels_BackgroundRefreshSingleFlight(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 	a := agent.(*Agent)
+	registerModelRefreshCleanup(t, a)
 
 	for i := 0; i < 5; i++ {
 		got := a.AvailableModels(context.Background())
@@ -842,11 +861,8 @@ func TestAvailableModels_BackgroundRefreshSingleFlight(t *testing.T) {
 			t.Fatalf("AvailableModels() call %d = %v, want cached/model", i, got)
 		}
 	}
-	waitForFileContent(t, countPath, "1")
-	if err := os.WriteFile(gatePath, []byte("ok"), 0o644); err != nil {
-		t.Fatalf("os.WriteFile(%q) error = %v", gatePath, err)
-	}
-	waitForModelsInPersistentCache(t, cachePath, []string{"fresh/model"})
+	releaseAndJoinModelRefresh(t, a, gatePath)
+	assertFileContent(t, countPath, "1")
 	data, err := os.ReadFile(countPath)
 	if err != nil {
 		t.Fatalf("os.ReadFile(%q) error = %v", countPath, err)
@@ -873,6 +889,7 @@ func TestStartInitialModelRefresh_UsesCurrentProviderWiring(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 	a := agent.(*Agent)
+	registerModelRefreshCleanup(t, a)
 	a.SetProviders([]core.ProviderConfig{{
 		Name: "provider-a",
 		Env:  map[string]string{"MODEL_DISCOVERY_TOKEN": "present"},
@@ -882,11 +899,9 @@ func TestStartInitialModelRefresh_UsesCurrentProviderWiring(t *testing.T) {
 	}
 
 	a.StartInitialModelRefresh()
-	waitForFileContent(t, countPath, "1")
-	if err := os.WriteFile(gatePath, []byte("ok"), 0o644); err != nil {
-		t.Fatalf("os.WriteFile(%q) error = %v", gatePath, err)
-	}
-	waitForModelsInPersistentCache(t, cachePath, []string{"provider/model"})
+	releaseAndJoinModelRefresh(t, a, gatePath)
+	assertFileContent(t, countPath, "1")
+	assertPersistentModels(t, cachePath, []string{"provider/model"})
 }
 
 func TestStartInitialModelRefresh_PrewarmsColdStartCacheAfterProviderWiring(t *testing.T) {
@@ -905,6 +920,7 @@ func TestStartInitialModelRefresh_PrewarmsColdStartCacheAfterProviderWiring(t *t
 		t.Fatalf("New() error = %v", err)
 	}
 	a := agent.(*Agent)
+	registerModelRefreshCleanup(t, a)
 	a.SetProviders([]core.ProviderConfig{{
 		Name: "provider-a",
 		Env:  map[string]string{"MODEL_DISCOVERY_TOKEN": "present"},
@@ -919,11 +935,68 @@ func TestStartInitialModelRefresh_PrewarmsColdStartCacheAfterProviderWiring(t *t
 	}
 
 	a.StartInitialModelRefresh()
-	waitForFileContent(t, countPath, "1")
-	if err := os.WriteFile(gatePath, []byte("ok"), 0o644); err != nil {
-		t.Fatalf("os.WriteFile(%q) error = %v", gatePath, err)
+	releaseAndJoinModelRefresh(t, a, gatePath)
+	assertFileContent(t, countPath, "1")
+	assertPersistentModels(t, cachePath, []string{"provider/model"})
+}
+
+func TestStopCancelsAndJoinsInitialModelRefresh(t *testing.T) {
+	countPath := filepath.Join(t.TempDir(), "refresh-count")
+	gatePath := filepath.Join(t.TempDir(), "refresh-ready")
+	bin := writeCountingModelsBin(t, countPath, gatePath, []string{"provider/model"}, "", 0)
+	dataDir := t.TempDir()
+	cachePath := opencodeProjectModelCachePath(dataDir, "stop-joins-refresh")
+	agent, err := New(map[string]any{
+		"cmd":         bin,
+		"cc_data_dir": dataDir,
+		"cc_project":  "stop-joins-refresh",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
 	}
-	waitForModelsInPersistentCache(t, cachePath, []string{"provider/model"})
+	a := agent.(*Agent)
+	a.StartInitialModelRefresh()
+	waitForHelperFileContent(t, countPath, "1")
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- a.Stop() }()
+	stopTimedOut := false
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+	case <-time.After(opencodeModelRefreshTimeout):
+		stopTimedOut = true
+	}
+	if err := os.WriteFile(gatePath, []byte("ok"), 0o644); err != nil {
+		t.Fatalf("release model refresh: %v", err)
+	}
+	if stopTimedOut {
+		select {
+		case err := <-stopDone:
+			if err != nil {
+				t.Fatalf("Stop() error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Stop() did not return after model refresh completed")
+		}
+	}
+	if stopTimedOut {
+		t.Fatal("Stop() did not cancel the in-flight initial model refresh")
+	}
+	if cache, err := loadOpencodePersistentModelCache(cachePath); err != nil {
+		t.Fatalf("load cache after Stop: %v", err)
+	} else if cache != nil {
+		t.Fatalf("cancelled refresh wrote a late cache: %#v", cache)
+	}
+	a.StartInitialModelRefresh()
+	a.refreshWg.Wait()
+	if cache, err := loadOpencodePersistentModelCache(cachePath); err != nil {
+		t.Fatalf("load cache after post-Stop refresh request: %v", err)
+	} else if cache != nil {
+		t.Fatalf("post-Stop refresh request wrote a cache: %#v", cache)
+	}
 }
 
 func TestAvailableModels_DiscoveryUsesProviderEnv(t *testing.T) {
@@ -1027,6 +1100,7 @@ func TestAvailableModels_BackgroundRefreshPersistsProviderKey(t *testing.T) {
 		}},
 		activeIdx: 0,
 	}
+	registerModelRefreshCleanup(t, a)
 	providerAKey := providerCacheKeyOf(t, a)
 	providerASnapshot := a.modelDiscoverySnapshot()
 	writePersistentModelCacheWithSnapshot(t, cachePath, providerASnapshot, []core.ModelOption{{Name: "cached/model"}}, time.Now())
@@ -1036,10 +1110,8 @@ func TestAvailableModels_BackgroundRefreshPersistsProviderKey(t *testing.T) {
 	if len(got) != 1 || got[0].Name != "cached/model" {
 		t.Fatalf("AvailableModels() = %v, want cached/model", got)
 	}
-	if err := os.WriteFile(gatePath, []byte("ok"), 0o644); err != nil {
-		t.Fatalf("os.WriteFile(%q) error = %v", gatePath, err)
-	}
-	waitForModelsInPersistentCache(t, cachePath, []string{"fresh/model"})
+	releaseAndJoinModelRefresh(t, a, gatePath)
+	assertPersistentModels(t, cachePath, []string{"fresh/model"})
 	payload := readPersistentModelCachePayload(t, cachePath)
 	if payload["provider_key"] != providerAKey {
 		t.Fatalf("provider_key = %v, want %q", payload["provider_key"], providerAKey)
@@ -1062,6 +1134,7 @@ func TestAvailableModels_BackgroundRefreshUsesProviderSnapshot(t *testing.T) {
 		},
 		activeIdx: 0,
 	}
+	registerModelRefreshCleanup(t, a)
 	providerAKey := providerCacheKeyOf(t, a)
 	providerASnapshot := a.modelDiscoverySnapshot()
 	writePersistentModelCacheWithSnapshot(t, cachePath, providerASnapshot, []core.ModelOption{{Name: "cached/model"}}, time.Now())
@@ -1071,14 +1144,12 @@ func TestAvailableModels_BackgroundRefreshUsesProviderSnapshot(t *testing.T) {
 	if len(got) != 1 || got[0].Name != "cached/model" {
 		t.Fatalf("AvailableModels() = %v, want cached/model", got)
 	}
-	waitForFileContent(t, countPath, "1")
 	if !a.SetActiveProvider("provider-b") {
 		t.Fatal("SetActiveProvider(provider-b) = false, want true")
 	}
-	if err := os.WriteFile(gatePath, []byte("ok"), 0o644); err != nil {
-		t.Fatalf("os.WriteFile(%q) error = %v", gatePath, err)
-	}
-	waitForModelsInPersistentCache(t, cachePath, []string{"provider-a/model"})
+	releaseAndJoinModelRefresh(t, a, gatePath)
+	assertFileContent(t, countPath, "1")
+	assertPersistentModels(t, cachePath, []string{"provider-a/model"})
 	payload := readPersistentModelCachePayload(t, cachePath)
 	if payload["provider_key"] != providerAKey {
 		t.Fatalf("provider_key after provider switch = %v, want %q snapshot", payload["provider_key"], providerAKey)
@@ -1162,7 +1233,7 @@ func TestAvailableModels_IgnoresPersistentCacheForWorkDirMismatch(t *testing.T) 
 	if len(got) != 1 || got[0].Name != "fresh/workspace-b" {
 		t.Fatalf("AvailableModels() = %v, want stale cache ignored for changed workdir", got)
 	}
-	waitForFileContent(t, countPath, "1")
+	assertFileContent(t, countPath, "1")
 	payload := readPersistentModelCachePayload(t, cachePath)
 	if payload["provider_key"] != staleSnapshot.providerKey {
 		t.Fatalf("provider_key = %v, want %q", payload["provider_key"], staleSnapshot.providerKey)
