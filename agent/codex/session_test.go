@@ -431,7 +431,8 @@ func TestSend_WithImages_PassesImageArgsAndDefaultPrompt(t *testing.T) {
 		t.Fatalf("Send: %v", err)
 	}
 
-	args := waitForArgsFile(t, argsFile)
+	waitForCodexCommands(t, cs)
+	args := readArgsFile(t, argsFile)
 	if !containsSequence(args, []string{"exec", "--skip-git-repo-check"}) {
 		t.Fatalf("args missing exec prelude: %v", args)
 	}
@@ -486,7 +487,8 @@ func TestSend_ResumeWithImages_PlacesSessionBeforeImageFlags(t *testing.T) {
 		t.Fatalf("Send: %v", err)
 	}
 
-	args := waitForArgsFile(t, argsFile)
+	waitForCodexCommands(t, cs)
+	args := readArgsFile(t, argsFile)
 	if !containsSequence(args, []string{"exec", "resume", "--skip-git-repo-check"}) {
 		t.Fatalf("args missing resume prelude: %v", args)
 	}
@@ -539,14 +541,19 @@ func TestSend_UsesStdinForMultilinePrompt(t *testing.T) {
 		t.Fatalf("Send: %v", err)
 	}
 
-	args := waitForArgsFile(t, argsFile)
+	waitForCodexCommands(t, cs)
+	args := readArgsFile(t, argsFile)
 	if !containsSequence(args, []string{"--json", "-"}) {
 		t.Fatalf("args missing stdin marker: %v", args)
 	}
 
-	// cat > file creates the path before stdin is fully read; polling until
-	// content matches avoids racing an empty read (flaky under -cover / CI).
-	waitForFileEquals(t, stdinFile, prompt)
+	stdin, err := os.ReadFile(stdinFile)
+	if err != nil {
+		t.Fatalf("read stdin file: %v", err)
+	}
+	if string(stdin) != prompt {
+		t.Fatalf("stdin file %s: got %q, want %q", stdinFile, string(stdin), prompt)
+	}
 }
 
 func TestSend_PrependsProjectPromptOnFreshSession(t *testing.T) {
@@ -580,14 +587,21 @@ func TestSend_PrependsProjectPromptOnFreshSession(t *testing.T) {
 	if err := cs.Send("Create a Chat issue.", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
+	waitForCodexCommands(t, cs)
 
 	wantParts := []string{
 		"Project system prompt:\nYou are Linear Reporter.",
 		"Additional project instructions:\nAlways invoke linear-bug-intake.",
 		"User message:\nCreate a Chat issue.",
 	}
+	stdin, err := os.ReadFile(stdinFile)
+	if err != nil {
+		t.Fatalf("read stdin file: %v", err)
+	}
 	for _, want := range wantParts {
-		waitForFileContains(t, stdinFile, want)
+		if !strings.Contains(string(stdin), want) {
+			t.Fatalf("file %s: got %q, want substring %q", stdinFile, string(stdin), want)
+		}
 	}
 }
 
@@ -662,25 +676,6 @@ func TestSend_HandlesLargeJSONLines(t *testing.T) {
 	}
 }
 
-func TestWaitForArgsFile_WaitsForNonEmptyContent(t *testing.T) {
-	workDir := t.TempDir()
-	argsFile := filepath.Join(workDir, "args.txt")
-
-	if err := os.WriteFile(argsFile, []byte(""), 0o644); err != nil {
-		t.Fatalf("write empty args file: %v", err)
-	}
-
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		_ = os.WriteFile(argsFile, []byte("exec\n--json\n"), 0o644)
-	}()
-
-	args := waitForArgsFile(t, argsFile)
-	if !containsSequence(args, []string{"exec", "--json"}) {
-		t.Fatalf("expected non-empty args sequence, got: %v", args)
-	}
-}
-
 func TestWriteFakeCodexScript_PreservesArgsWithSpaces(t *testing.T) {
 	workDir := t.TempDir()
 	binDir := filepath.Join(workDir, "bin")
@@ -699,7 +694,7 @@ func TestWriteFakeCodexScript_PreservesArgsWithSpaces(t *testing.T) {
 		t.Fatalf("fake codex run: %v", err)
 	}
 
-	args := waitForArgsFile(t, argsFile)
+	args := readArgsFile(t, argsFile)
 	wantPath := filepath.Join(workDir, "dir with spaces")
 	if !containsSequence(args, []string{"exec", "--cd", wantPath, "-"}) {
 		t.Fatalf("args = %v, want path with spaces preserved as %q", args, wantPath)
@@ -718,11 +713,13 @@ function fakeCodexArgs {
 // The fake CLI runs concurrently with the assertion goroutine. Publish its
 // argv snapshot only after the complete file has been written; otherwise a
 // reader can observe a valid but truncated prefix under scheduler pressure.
-const fakeCodexAtomicArgsShell = "args_tmp=\"${CODEX_ARGS_FILE}.tmp.$$\"\n" +
+const fakeCodexAtomicArgsShell = "set -eu\n" +
+	"args_tmp=\"${CODEX_ARGS_FILE}.tmp.$$\"\n" +
 	"printf '%s\\n' \"$@\" > \"$args_tmp\"\n" +
 	"mv -f \"$args_tmp\" \"$CODEX_ARGS_FILE\"\n"
 
 const fakeCodexAtomicArgsPowerShell = `
+$ErrorActionPreference = 'Stop'
 $argsTemp = "$env:CODEX_ARGS_FILE.tmp.$PID"
 [IO.File]::WriteAllLines($argsTemp, (fakeCodexArgs))
 Move-Item -LiteralPath $argsTemp -Destination $env:CODEX_ARGS_FILE -Force
@@ -762,59 +759,43 @@ func writeFakeCodexScript(t *testing.T, dir, shellScript, powershellScript strin
 	}
 }
 
-func waitForArgsFile(t *testing.T, path string) []string {
+func waitForCodexCommands(t *testing.T, cs *codexSession) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(path)
-		if err == nil {
-			text := strings.TrimSpace(string(data))
-			if text != "" {
-				lines := strings.Split(text, "\n")
-				args := make([]string, 0, len(lines))
-				for _, line := range lines {
-					line = strings.TrimSpace(line)
-					if line != "" {
-						args = append(args, line)
-					}
-				}
-				if len(args) > 0 {
-					return args
-				}
+	// Send is asynchronous. The session's lifecycle owner reaches Done only
+	// after stdout has been drained and cmd.Wait has returned, so this is the
+	// mechanical completion fact for files produced by the fake CLI.
+	cs.wg.Wait()
+	for {
+		select {
+		case evt := <-cs.Events():
+			if evt.Type == core.EventError {
+				t.Fatalf("fake codex process failed: %v", evt.Error)
 			}
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for non-empty args file: %s", path)
-	return nil
-}
-
-func waitForFileEquals(t *testing.T, path, want string) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(path)
-		if err == nil && string(data) == want {
+		default:
 			return
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
-	data, _ := os.ReadFile(path)
-	t.Fatalf("stdin file %s: got %q, want %q", path, string(data), want)
 }
 
-func waitForFileContains(t *testing.T, path, want string) {
+func readArgsFile(t *testing.T, path string) []string {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(path)
-		if err == nil && strings.Contains(string(data), want) {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read args file %s: %v", path, err)
 	}
-	data, _ := os.ReadFile(path)
-	t.Fatalf("file %s: got %q, want substring %q", path, string(data), want)
+	text := strings.TrimSpace(string(data))
+	if text == "" {
+		t.Fatalf("args file %s is empty", path)
+	}
+	lines := strings.Split(text, "\n")
+	args := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			args = append(args, line)
+		}
+	}
+	return args
 }
 
 func containsSequence(args, want []string) bool {
