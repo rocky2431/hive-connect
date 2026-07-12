@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -34,10 +36,11 @@ func TestNewReadsOptionsAndEnvironment(t *testing.T) {
 	t.Setenv("HIVE_CONNECT_TOKEN", "hb_env_token")
 
 	plat, err := New(map[string]any{
-		"api_prefix":   "/api/v1",
-		"device_name":  "Rocky Mac",
-		"runtime_kind": "codex",
-		"allow_from":   "owner-1",
+		"api_prefix":         "/api/v1",
+		"device_name":        "Rocky Mac",
+		"runtime_kind":       "codex",
+		"allow_from":         "owner-1",
+		"receipt_store_path": filepath.Join(t.TempDir(), "execution-receipts.json"),
 	})
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
@@ -88,6 +91,8 @@ func TestCoreMessageFromHivePayload(t *testing.T) {
 	fileBody := []byte("# hello")
 	msg, err := coreMessageFromHive(hiveMessagePayload{
 		ID:          "msg-1",
+		ReplayKey:   "local:msg-1",
+		RequestHash: "request-hash-msg-1",
 		SessionID:   "sess-1",
 		OwnerUserID: "owner-1",
 		Content:     "please inspect this",
@@ -131,6 +136,9 @@ func TestCoreMessageFromHivePayload(t *testing.T) {
 	if rctx.SessionID != "sess-1" || rctx.MessageID != "msg-1" {
 		t.Fatalf("ReplyCtx = %#v", rctx)
 	}
+	if rctx.ReplayKey != "local:msg-1" {
+		t.Fatalf("ReplyCtx replay key = %q", rctx.ReplayKey)
+	}
 }
 
 func TestPlatformWebSocketRoundTrip(t *testing.T) {
@@ -173,6 +181,8 @@ func TestPlatformWebSocketRoundTrip(t *testing.T) {
 				"type": "message",
 				"message": map[string]any{
 					"id":            "msg-1",
+					"replay_key":    "local:msg-1",
+					"request_hash":  "request-hash-msg-1",
 					"session_id":    "sess-1",
 					"owner_user_id": "owner-1",
 					"content":       "hello from Hive",
@@ -194,9 +204,10 @@ func TestPlatformWebSocketRoundTrip(t *testing.T) {
 	defer server.Close()
 
 	plat, err := New(map[string]any{
-		"backend_url":  server.URL,
-		"token":        "hb_test",
-		"runtime_kind": "codex",
+		"backend_url":        server.URL,
+		"token":              "hb_test",
+		"runtime_kind":       "codex",
+		"receipt_store_path": filepath.Join(t.TempDir(), "execution-receipts.json"),
 	})
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
@@ -294,6 +305,8 @@ func TestPlatformReconnectsAfterServerClose(t *testing.T) {
 				"type": "message",
 				"message": map[string]any{
 					"id":            "msg-reconnected",
+					"replay_key":    "local:msg-reconnected",
+					"request_hash":  "request-hash-msg-reconnected",
 					"session_id":    "sess-1",
 					"owner_user_id": "owner-1",
 					"content":       "after reconnect",
@@ -313,9 +326,10 @@ func TestPlatformReconnectsAfterServerClose(t *testing.T) {
 	defer server.Close()
 
 	plat, err := New(map[string]any{
-		"backend_url":  server.URL,
-		"token":        "hb_test",
-		"runtime_kind": "codex",
+		"backend_url":        server.URL,
+		"token":              "hb_test",
+		"runtime_kind":       "codex",
+		"receipt_store_path": filepath.Join(t.TempDir(), "execution-receipts.json"),
 	})
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
@@ -341,5 +355,369 @@ func TestPlatformReconnectsAfterServerClose(t *testing.T) {
 	case <-reconnected:
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for reconnect server exchange")
+	}
+}
+
+func TestReplayKeySuppressesAckLostDuplicateAndReplaysDurableResultAfterRestart(t *testing.T) {
+	receiptPath := filepath.Join(t.TempDir(), "execution-receipts.json")
+	payload := hiveMessagePayload{
+		ID:          "msg-replay-1",
+		ReplayKey:   "local:replay-1",
+		RequestHash: "request-hash-replay-1",
+		SessionID:   "session-replay-1",
+		OwnerUserID: "owner-1",
+		Content:     "perform one local side effect",
+	}
+
+	first, err := New(map[string]any{
+		"backend_url":        "https://hive.example",
+		"token":              "hb_test",
+		"allow_from":         "owner-1",
+		"receipt_store_path": receiptPath,
+	})
+	if err != nil {
+		t.Fatalf("New first platform: %v", err)
+	}
+	firstPlatform := first.(*Platform)
+	var executions atomic.Int32
+	var replyCtx any
+	firstPlatform.handler = func(_ core.Platform, msg *core.Message) {
+		executions.Add(1)
+		replyCtx = msg.ReplyCtx
+	}
+
+	// No websocket is attached, so both ACK writes are lost. The second cloud
+	// delivery must still be suppressed before it reaches the local agent.
+	firstPlatform.handleMessage(payload)
+	firstPlatform.handleMessage(payload)
+	if got := executions.Load(); got != 1 {
+		t.Fatalf("local executions after duplicate before ACK = %d, want 1", got)
+	}
+	if err := firstPlatform.Reply(context.Background(), replyCtx, "first durable result"); err == nil {
+		t.Fatal("Reply without websocket returned nil error")
+	}
+	// A second terminal write must never replace the first durable result.
+	if err := firstPlatform.Reply(context.Background(), replyCtx, "must not replace first result"); err == nil {
+		t.Fatal("second Reply without websocket returned nil error")
+	}
+
+	second, err := New(map[string]any{
+		"backend_url":        "https://hive.example",
+		"token":              "hb_test",
+		"allow_from":         "owner-1",
+		"receipt_store_path": receiptPath,
+	})
+	if err != nil {
+		t.Fatalf("New restarted platform: %v", err)
+	}
+	secondPlatform := second.(*Platform)
+	secondPlatform.handler = func(_ core.Platform, _ *core.Message) {
+		executions.Add(1)
+	}
+	frames := attachFrameCollector(t, secondPlatform)
+
+	secondPlatform.handleMessage(payload)
+	ack := waitForFrame(t, frames)
+	result := waitForFrame(t, frames)
+	if ack["type"] != "ack" || ack["message_id"] != payload.ID {
+		t.Fatalf("replay ACK = %#v", ack)
+	}
+	if result["type"] != "result" || result["status"] != "completed" {
+		t.Fatalf("replayed terminal frame = %#v", result)
+	}
+	if result["output"] != "first durable result" {
+		t.Fatalf("replayed output = %#v, want first durable result", result["output"])
+	}
+	if got := executions.Load(); got != 1 {
+		t.Fatalf("local executions after restart/redelivery = %d, want 1", got)
+	}
+}
+
+func TestRestartWithUnfinishedReplayKeyFailsClosedWithoutReexecution(t *testing.T) {
+	receiptPath := filepath.Join(t.TempDir(), "execution-receipts.json")
+	payload := hiveMessagePayload{
+		ID:          "msg-unknown-outcome",
+		ReplayKey:   "local:unknown-outcome",
+		RequestHash: "request-hash-unknown-outcome",
+		SessionID:   "session-unknown-outcome",
+		OwnerUserID: "owner-1",
+		Content:     "do not repeat after process death",
+	}
+
+	first, err := New(map[string]any{
+		"backend_url":        "https://hive.example",
+		"token":              "hb_test",
+		"allow_from":         "owner-1",
+		"receipt_store_path": receiptPath,
+	})
+	if err != nil {
+		t.Fatalf("New first platform: %v", err)
+	}
+	var executions atomic.Int32
+	first.(*Platform).handler = func(_ core.Platform, _ *core.Message) { executions.Add(1) }
+	first.(*Platform).handleMessage(payload)
+	if got := executions.Load(); got != 1 {
+		t.Fatalf("initial execution count = %d, want 1", got)
+	}
+
+	restarted, err := New(map[string]any{
+		"backend_url":        "https://hive.example",
+		"token":              "hb_test",
+		"allow_from":         "owner-1",
+		"receipt_store_path": receiptPath,
+	})
+	if err != nil {
+		t.Fatalf("New restarted platform: %v", err)
+	}
+	restartedPlatform := restarted.(*Platform)
+	restartedPlatform.handler = func(_ core.Platform, _ *core.Message) { executions.Add(1) }
+	frames := attachFrameCollector(t, restartedPlatform)
+
+	restartedPlatform.handleMessage(payload)
+	_ = waitForFrame(t, frames) // ACK closes the cloud delivery lease.
+	result := waitForFrame(t, frames)
+	if result["status"] != "failed" || result["error_code"] != "local_execution_outcome_unknown" {
+		t.Fatalf("restart reconciliation frame = %#v", result)
+	}
+	if got := executions.Load(); got != 1 {
+		t.Fatalf("local executions after unfinished restart = %d, want 1", got)
+	}
+}
+
+func TestMissingReplayKeyFailsClosed(t *testing.T) {
+	p, err := New(map[string]any{
+		"backend_url":        "https://hive.example",
+		"token":              "hb_test",
+		"allow_from":         "owner-1",
+		"receipt_store_path": filepath.Join(t.TempDir(), "execution-receipts.json"),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var executions atomic.Int32
+	p.(*Platform).handler = func(_ core.Platform, _ *core.Message) { executions.Add(1) }
+
+	p.(*Platform).handleMessage(hiveMessagePayload{
+		ID:          "msg-without-replay-key",
+		RequestHash: "request-hash-without-replay-key",
+		SessionID:   "session-1",
+		OwnerUserID: "owner-1",
+		Content:     "must not execute",
+	})
+	if got := executions.Load(); got != 0 {
+		t.Fatalf("local executions without replay key = %d, want 0", got)
+	}
+
+	p.(*Platform).handleMessage(hiveMessagePayload{
+		ID:          "msg-without-request-hash",
+		ReplayKey:   "local:without-request-hash",
+		SessionID:   "session-1",
+		OwnerUserID: "owner-1",
+		Content:     "must also not execute",
+	})
+	if got := executions.Load(); got != 0 {
+		t.Fatalf("local executions without request hash = %d, want 0", got)
+	}
+}
+
+func TestReplayKeyRequestHashTamperFailsClosed(t *testing.T) {
+	receiptPath := filepath.Join(t.TempDir(), "execution-receipts.json")
+	original := hiveMessagePayload{
+		ID:          "msg-tamper",
+		ReplayKey:   "local:tamper",
+		RequestHash: "request-hash-original",
+		SessionID:   "session-tamper",
+		OwnerUserID: "owner-1",
+		Content:     "approved command",
+	}
+	first, err := New(map[string]any{
+		"backend_url":        "https://hive.example",
+		"token":              "hb_test",
+		"allow_from":         "owner-1",
+		"receipt_store_path": receiptPath,
+	})
+	if err != nil {
+		t.Fatalf("New first platform: %v", err)
+	}
+	var executions atomic.Int32
+	var replyCtx any
+	first.(*Platform).handler = func(_ core.Platform, msg *core.Message) {
+		executions.Add(1)
+		replyCtx = msg.ReplyCtx
+	}
+	first.(*Platform).handleMessage(original)
+	_ = first.(*Platform).Reply(context.Background(), replyCtx, "approved result")
+
+	restarted, err := New(map[string]any{
+		"backend_url":        "https://hive.example",
+		"token":              "hb_test",
+		"allow_from":         "owner-1",
+		"receipt_store_path": receiptPath,
+	})
+	if err != nil {
+		t.Fatalf("New restarted platform: %v", err)
+	}
+	restartedPlatform := restarted.(*Platform)
+	restartedPlatform.handler = func(_ core.Platform, _ *core.Message) { executions.Add(1) }
+	frames := attachFrameCollector(t, restartedPlatform)
+	tampered := original
+	tampered.RequestHash = "request-hash-tampered"
+	tampered.Content = "different command under the same ids"
+
+	restartedPlatform.handleMessage(tampered)
+	_ = waitForFrame(t, frames)
+	result := waitForFrame(t, frames)
+	if result["status"] != "failed" || result["error_code"] != "replay_key_binding_conflict" {
+		t.Fatalf("tampered replay result = %#v", result)
+	}
+	if got := executions.Load(); got != 1 {
+		t.Fatalf("local executions after tampered replay = %d, want 1", got)
+	}
+}
+
+func TestResultAckPrunesOnlyAcknowledgedTerminalReceipts(t *testing.T) {
+	receiptPath := filepath.Join(t.TempDir(), "execution-receipts.json")
+	p, err := New(map[string]any{
+		"backend_url":         "https://hive.example",
+		"token":               "hb_test",
+		"allow_from":          "owner-1",
+		"receipt_store_path":  receiptPath,
+		"receipt_max_records": 1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	platform := p.(*Platform)
+	contexts := make(map[string]any)
+	platform.handler = func(_ core.Platform, msg *core.Message) { contexts[msg.MessageID] = msg.ReplyCtx }
+	for index := 1; index <= 2; index++ {
+		messageID := fmt.Sprintf("msg-ack-%d", index)
+		platform.handleMessage(hiveMessagePayload{
+			ID:          messageID,
+			ReplayKey:   fmt.Sprintf("local:ack-%d", index),
+			RequestHash: fmt.Sprintf("request-hash-ack-%d", index),
+			SessionID:   "session-ack",
+			OwnerUserID: "owner-1",
+			Content:     "one governed action",
+		})
+		_ = platform.Reply(context.Background(), contexts[messageID], fmt.Sprintf("result-%d", index))
+	}
+	if got := len(platform.receipts.records); got != 2 {
+		t.Fatalf("unacknowledged terminal receipt count = %d, want 2", got)
+	}
+
+	platform.handleFrame([]byte(`{
+		"type":"result_ack",
+		"message_id":"msg-ack-1",
+		"status":"completed",
+		"receipt":{"replay_key":"local:ack-1","request_hash":"tampered-request-hash"}
+	}`))
+	if got := len(platform.receipts.records); got != 2 {
+		t.Fatalf("mismatched result_ack pruned a receipt; count = %d, want 2", got)
+	}
+
+	platform.handleFrame([]byte(`{
+		"type":"result_ack",
+		"message_id":"msg-ack-1",
+		"status":"completed",
+		"receipt":{"replay_key":"local:ack-1","request_hash":"request-hash-ack-1"}
+	}`))
+	if got := len(platform.receipts.records); got != 1 {
+		t.Fatalf("receipt count after durable result_ack = %d, want 1", got)
+	}
+	if _, exists := platform.receipts.records["local:ack-2"]; !exists {
+		t.Fatal("unacknowledged terminal receipt was pruned")
+	}
+}
+
+func TestReceiptStoreFailsClosedOnCorruptionAndUsesPrivatePermissions(t *testing.T) {
+	root := t.TempDir()
+	corruptPath := filepath.Join(root, "corrupt-receipts.json")
+	if err := os.WriteFile(corruptPath, []byte("{not-json}"), 0o600); err != nil {
+		t.Fatalf("write corrupt receipt store: %v", err)
+	}
+	if _, err := New(map[string]any{
+		"backend_url":        "https://hive.example",
+		"token":              "hb_test",
+		"allow_from":         "owner-1",
+		"receipt_store_path": corruptPath,
+	}); err == nil {
+		t.Fatal("New accepted a corrupt execution receipt store")
+	}
+
+	receiptPath := filepath.Join(root, "private", "execution-receipts.json")
+	p, err := New(map[string]any{
+		"backend_url":        "https://hive.example",
+		"token":              "hb_test",
+		"allow_from":         "owner-1",
+		"receipt_store_path": receiptPath,
+	})
+	if err != nil {
+		t.Fatalf("New private store: %v", err)
+	}
+	p.(*Platform).handler = func(_ core.Platform, _ *core.Message) {}
+	p.(*Platform).handleMessage(hiveMessagePayload{
+		ID:          "msg-private-receipt",
+		ReplayKey:   "local:private-receipt",
+		RequestHash: "request-hash-private-receipt",
+		SessionID:   "session-private-receipt",
+		OwnerUserID: "owner-1",
+		Content:     "persist privately",
+	})
+	info, err := os.Stat(receiptPath)
+	if err != nil {
+		t.Fatalf("stat receipt store: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("receipt store permissions = %o, want 600", got)
+	}
+}
+
+func attachFrameCollector(t *testing.T, p *Platform) <-chan map[string]any {
+	t.Helper()
+	frames := make(chan map[string]any, 8)
+	connected := make(chan *websocket.Conn, 1)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade frame collector: %v", err)
+			return
+		}
+		connected <- conn
+		for {
+			var frame map[string]any
+			if err := conn.ReadJSON(&frame); err != nil {
+				return
+			}
+			frames <- frame
+		}
+	}))
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	client, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		server.Close()
+		t.Fatalf("dial frame collector: %v", err)
+	}
+	serverConn := <-connected
+	p.connMu.Lock()
+	p.conn = client
+	p.connMu.Unlock()
+	t.Cleanup(func() {
+		_ = p.closeConn()
+		_ = serverConn.Close()
+		server.Close()
+	})
+	return frames
+}
+
+func waitForFrame(t *testing.T, frames <-chan map[string]any) map[string]any {
+	t.Helper()
+	select {
+	case frame := <-frames:
+		return frame
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for websocket frame")
+		return nil
 	}
 }

@@ -981,6 +981,8 @@ mode = "default" # "default" | "acceptEdits" (edit) | "plan" | "auto" | "bypassP
 #   runtime_kind: Local agent runtime name displayed in Hive, default "hive-connect"
 #   device_name:  Local device name displayed in Hive
 #   allow_from:   Owner user IDs allowed to invoke this runner; "*" or empty allows all token-authorized owners
+#   receipt_store_path: Override the restart-safe local execution receipt file
+#   receipt_max_records: Max cloud-acknowledged terminal receipts retained; unacknowledged results are never capacity-pruned
 #
 # [[projects.platforms]]
 # type = "hive"
@@ -992,6 +994,8 @@ mode = "default" # "default" | "acceptEdits" (edit) | "plan" | "auto" | "bypassP
 # runtime_kind = "codex"
 # device_name = "Rocky Mac"
 # allow_from = "*"
+# receipt_store_path = "/Users/you/.hive-connect/data/hive/execution-receipts/custom.json"
+# receipt_max_records = 10000
 
 # Feishu / Lark / 飞书
 # 1. Create an app at https://open.feishu.cn / 在 https://open.feishu.cn 创建应用

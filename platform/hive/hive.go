@@ -3,8 +3,10 @@ package hive
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -55,6 +58,8 @@ type Platform struct {
 
 	connMu sync.Mutex
 	conn   *websocket.Conn
+
+	receipts *executionReceiptStore
 }
 
 type wsTicketResponse struct {
@@ -62,9 +67,16 @@ type wsTicketResponse struct {
 }
 
 type wsEnvelope struct {
-	Type    string              `json:"type"`
-	Message *hiveMessagePayload `json:"message,omitempty"`
-	Error   string              `json:"error,omitempty"`
+	Type      string              `json:"type"`
+	Message   *hiveMessagePayload `json:"message,omitempty"`
+	MessageID string              `json:"message_id,omitempty"`
+	Receipt   *resultAckReceipt   `json:"receipt,omitempty"`
+	Error     string              `json:"error,omitempty"`
+}
+
+type resultAckReceipt struct {
+	ReplayKey   string `json:"replay_key"`
+	RequestHash string `json:"request_hash"`
 }
 
 type hiveMessagePayload struct {
@@ -77,6 +89,8 @@ type hiveMessagePayload struct {
 	Content       string                  `json:"content"`
 	Attachments   []hiveAttachmentPayload `json:"attachments,omitempty"`
 	Metadata      map[string]any          `json:"metadata,omitempty"`
+	ReplayKey     string                  `json:"replay_key"`
+	RequestHash   string                  `json:"request_hash,omitempty"`
 	CreatedAt     string                  `json:"created_at,omitempty"`
 }
 
@@ -95,6 +109,16 @@ type hiveAttachmentPayload struct {
 type replyContext struct {
 	SessionID string
 	MessageID string
+	ReplayKey string
+}
+
+type resultFrame struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+	MessageID string `json:"message_id"`
+	Status    string `json:"status"`
+	Output    string `json:"output,omitempty"`
+	ErrorCode string `json:"error_code,omitempty"`
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -134,6 +158,11 @@ func New(opts map[string]any) (core.Platform, error) {
 	for k, v := range mapOpt(opts, "capabilities") {
 		capabilities[k] = v
 	}
+	receiptPath := resolveReceiptStorePath(opts, baseURL, deviceName)
+	receipts, err := newExecutionReceiptStore(receiptPath, positiveIntOpt(opts["receipt_max_records"], defaultReceiptMaxRecords))
+	if err != nil {
+		return nil, fmt.Errorf("hive: initialize execution receipt store: %w", err)
+	}
 
 	return &Platform{
 		baseURL:      baseURL,
@@ -145,6 +174,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		capabilities: capabilities,
 		httpClient:   &http.Client{Timeout: httpRequestTimeout},
 		dialer:       websocket.DefaultDialer,
+		receipts:     receipts,
 	}, nil
 }
 
@@ -193,13 +223,20 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 			"content": content,
 		})
 	}
-	return p.writeJSONWithContext(ctx, map[string]any{
-		"type":       "result",
-		"session_id": rc.SessionID,
-		"message_id": rc.MessageID,
-		"status":     "completed",
-		"output":     content,
+	if p.receipts == nil {
+		return errors.New("hive: execution receipt store is unavailable")
+	}
+	result, err := p.receipts.complete(rc.ReplayKey, rc.MessageID, resultFrame{
+		Type:      "result",
+		SessionID: rc.SessionID,
+		MessageID: rc.MessageID,
+		Status:    "completed",
+		Output:    content,
 	})
+	if err != nil {
+		return fmt.Errorf("hive: persist execution result: %w", err)
+	}
+	return p.writeJSONWithContext(ctx, result)
 }
 
 func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
@@ -438,7 +475,10 @@ func (p *Platform) handleFrame(raw []byte) {
 		return
 	}
 	switch frame.Type {
-	case "hello", "ready_ack", "ack_ack", "event_ack", "result_ack", "pong":
+	case "hello", "ready_ack", "ack_ack", "event_ack", "pong":
+		return
+	case "result_ack":
+		p.handleResultAck(frame)
 		return
 	case "error":
 		slog.Warn("hive: websocket error frame", "error", frame.Error)
@@ -462,13 +502,105 @@ func (p *Platform) handleMessage(payload hiveMessagePayload) {
 		slog.Debug("hive: message from unauthorized owner", "user", msg.UserID)
 		return
 	}
-	if payload.ID != "" {
-		if err := p.writeJSON(map[string]any{"type": "ack", "message_id": payload.ID}); err != nil {
-			slog.Warn("hive: ack failed", "error", err)
+	if strings.TrimSpace(payload.ReplayKey) == "" {
+		slog.Error("hive: refusing local execution without replay key", "message_id", payload.ID)
+		p.ackAndReportFailure(payload, "missing_replay_key", "Hive did not provide the required replay key; the local action was not executed.")
+		return
+	}
+	if strings.TrimSpace(payload.RequestHash) == "" {
+		slog.Error("hive: refusing local execution without request hash", "message_id", payload.ID, "replay_key", payload.ReplayKey)
+		p.ackAndReportFailure(payload, "missing_request_hash", "Hive did not provide the required request hash; the local action was not executed.")
+		return
+	}
+	if p.receipts == nil {
+		slog.Error("hive: refusing local execution without receipt store", "message_id", payload.ID, "replay_key", payload.ReplayKey)
+		return
+	}
+	claim, err := p.receipts.claim(payload.ReplayKey, payload.ID, payload.RequestHash, payload.SessionID)
+	if err != nil {
+		if errors.Is(err, errReplayBindingConflict) {
+			slog.Error("hive: refusing replay key binding conflict", "message_id", payload.ID, "replay_key", payload.ReplayKey, "error", err)
+			p.ackAndReportFailure(payload, "replay_key_binding_conflict", "The replay key is already bound to a different Hive message; the local action was not executed.")
+			return
+		}
+		// No ACK is sent when the durable claim cannot be committed. The cloud
+		// lease may retry after local storage is repaired, but no side effect ran.
+		slog.Error("hive: failed to persist local execution claim", "message_id", payload.ID, "replay_key", payload.ReplayKey, "error", err)
+		return
+	}
+	p.ackMessage(payload.ID)
+	switch claim.Kind {
+	case receiptClaimActive:
+		slog.Info("hive: duplicate delivery joined active local execution", "message_id", payload.ID, "replay_key", payload.ReplayKey)
+		return
+	case receiptClaimReplay, receiptClaimRecoveredUnknown:
+		if claim.Result == nil {
+			slog.Error("hive: durable receipt is missing result", "message_id", payload.ID, "replay_key", payload.ReplayKey)
+			return
+		}
+		if err := p.writeJSON(*claim.Result); err != nil {
+			slog.Warn("hive: durable result replay failed", "message_id", payload.ID, "replay_key", payload.ReplayKey, "error", err)
+		}
+		return
+	case receiptClaimNew:
+		if p.handler != nil {
+			p.handler(p, msg)
+			return
+		}
+		result, completeErr := p.receipts.complete(payload.ReplayKey, payload.ID, resultFrame{
+			Type:      "result",
+			SessionID: payload.SessionID,
+			MessageID: payload.ID,
+			Status:    "failed",
+			Output:    "Hive Connect has no local message handler; the action was not executed.",
+			ErrorCode: "local_handler_unavailable",
+		})
+		if completeErr != nil {
+			slog.Error("hive: failed to persist missing-handler result", "message_id", payload.ID, "replay_key", payload.ReplayKey, "error", completeErr)
+			return
+		}
+		if err := p.writeJSON(result); err != nil {
+			slog.Warn("hive: missing-handler result delivery failed", "message_id", payload.ID, "replay_key", payload.ReplayKey, "error", err)
 		}
 	}
-	if p.handler != nil {
-		p.handler(p, msg)
+}
+
+func (p *Platform) handleResultAck(frame wsEnvelope) {
+	if p.receipts == nil {
+		slog.Error("hive: result acknowledgement arrived without receipt store", "message_id", frame.MessageID)
+		return
+	}
+	if frame.Receipt == nil {
+		// A legacy/partial acknowledgement is not sufficient evidence to delete
+		// the terminal result. Retaining it is safer than enabling re-execution.
+		slog.Warn("hive: result acknowledgement omitted durable receipt", "message_id", frame.MessageID)
+		return
+	}
+	if err := p.receipts.acknowledge(frame.Receipt.ReplayKey, frame.MessageID, frame.Receipt.RequestHash); err != nil {
+		slog.Warn("hive: result acknowledgement did not match durable receipt", "message_id", frame.MessageID, "replay_key", frame.Receipt.ReplayKey, "error", err)
+	}
+}
+
+func (p *Platform) ackMessage(messageID string) {
+	if strings.TrimSpace(messageID) == "" {
+		return
+	}
+	if err := p.writeJSON(map[string]any{"type": "ack", "message_id": messageID}); err != nil {
+		slog.Warn("hive: ack failed", "message_id", messageID, "error", err)
+	}
+}
+
+func (p *Platform) ackAndReportFailure(payload hiveMessagePayload, code, output string) {
+	p.ackMessage(payload.ID)
+	if err := p.writeJSON(resultFrame{
+		Type:      "result",
+		SessionID: payload.SessionID,
+		MessageID: payload.ID,
+		Status:    "failed",
+		Output:    output,
+		ErrorCode: code,
+	}); err != nil {
+		slog.Warn("hive: failure result delivery failed", "message_id", payload.ID, "error", err)
 	}
 }
 
@@ -577,6 +709,7 @@ func coreMessageFromHive(payload hiveMessagePayload) (*core.Message, error) {
 		ReplyCtx: replyContext{
 			SessionID: payload.SessionID,
 			MessageID: payload.ID,
+			ReplayKey: payload.ReplayKey,
 		},
 	}, nil
 }
@@ -709,6 +842,64 @@ func mapOpt(opts map[string]any, key string) map[string]any {
 	default:
 		return nil
 	}
+}
+
+func resolveReceiptStorePath(opts map[string]any, baseURL, deviceName string) string {
+	if override := firstNonEmptyString(
+		stringOpt(opts, "receipt_store_path"),
+		os.Getenv("HIVE_CONNECT_RECEIPT_STORE_PATH"),
+	); override != "" {
+		return filepath.Clean(override)
+	}
+	dataDir := stringOpt(opts, "cc_data_dir")
+	if dataDir == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			dataDir = filepath.Join(home, ".hive-connect", "data")
+		} else {
+			dataDir = filepath.Join(".hive-connect", "data")
+		}
+	}
+	identity := strings.Join([]string{
+		strings.TrimSpace(baseURL),
+		stringOpt(opts, "cc_project"),
+		strings.TrimSpace(deviceName),
+	}, "\x00")
+	digest := sha256.Sum256([]byte(identity))
+	return filepath.Join(dataDir, "hive", "execution-receipts", fmt.Sprintf("%x.json", digest[:8]))
+}
+
+func positiveIntOpt(value any, fallback int) int {
+	var parsed int
+	switch v := value.(type) {
+	case int:
+		parsed = v
+	case int8:
+		parsed = int(v)
+	case int16:
+		parsed = int(v)
+	case int32:
+		parsed = int(v)
+	case int64:
+		parsed = int(v)
+	case uint:
+		parsed = int(v)
+	case uint8:
+		parsed = int(v)
+	case uint16:
+		parsed = int(v)
+	case uint32:
+		parsed = int(v)
+	case uint64:
+		if v <= uint64(^uint(0)>>1) {
+			parsed = int(v)
+		}
+	case float64:
+		parsed = int(v)
+	}
+	if parsed <= 0 {
+		return fallback
+	}
+	return parsed
 }
 
 func firstNonEmptyString(values ...string) string {
