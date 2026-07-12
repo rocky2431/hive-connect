@@ -48,8 +48,9 @@ func (j *CronJob) IsShellJob() bool {
 const defaultCronJobTimeout = 30 * time.Minute
 
 var (
-	ErrCronJobNotFound     = errors.New("cron job not found")
-	ErrCronProjectNotFound = errors.New("cron project not found")
+	ErrCronJobNotFound      = errors.New("cron job not found")
+	ErrCronProjectNotFound  = errors.New("cron project not found")
+	ErrCronSchedulerStopped = errors.New("cron scheduler is stopped")
 )
 
 // ExecutionTimeout returns how long the scheduler waits for the job goroutine to finish.
@@ -418,14 +419,22 @@ type CronScheduler struct {
 	entries            map[string]cron.EntryID // job ID → cron entry
 	defaultSilent      bool                    // global default for suppressing cron start notifications
 	defaultSessionMode string                  // global default session mode; "" = reuse, "new_per_run" = fresh session each run
+	ctx                context.Context
+	cancel             context.CancelFunc
+	stopping           bool
+	runs               sync.WaitGroup
+	stopOnce           sync.Once
 }
 
 func NewCronScheduler(store *CronStore) *CronScheduler {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &CronScheduler{
 		store:   store,
 		cron:    cron.New(),
 		engines: make(map[string]*Engine),
 		entries: make(map[string]cron.EntryID),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 }
 
@@ -461,10 +470,15 @@ func (cs *CronScheduler) UsesNewSession(job *CronJob) bool {
 }
 
 func (cs *CronScheduler) Start() error {
+	done, ok := cs.beginTask()
+	if !ok {
+		return ErrCronSchedulerStopped
+	}
+	defer done()
 	jobs := cs.store.List()
 	for _, job := range jobs {
 		if job.Enabled {
-			if err := cs.scheduleJob(job); err != nil {
+			if err := cs.scheduleJobOwned(job); err != nil {
 				slog.Warn("cron: failed to schedule job", "id", job.ID, "error", err)
 			}
 		}
@@ -475,10 +489,26 @@ func (cs *CronScheduler) Start() error {
 }
 
 func (cs *CronScheduler) Stop() {
-	cs.cron.Stop()
+	cs.stopOnce.Do(func() {
+		cs.mu.Lock()
+		cs.stopping = true
+		cancel := cs.cancel
+		cs.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		cs.runs.Wait()
+		cronDone := cs.cron.Stop()
+		<-cronDone.Done()
+	})
 }
 
 func (cs *CronScheduler) AddJob(job *CronJob) error {
+	done, ok := cs.beginTask()
+	if !ok {
+		return ErrCronSchedulerStopped
+	}
+	defer done()
 	if err := validateCronJob(job); err != nil {
 		return err
 	}
@@ -490,7 +520,7 @@ func (cs *CronScheduler) AddJob(job *CronJob) error {
 		return err
 	}
 	if job.Enabled {
-		return cs.scheduleJob(job)
+		return cs.scheduleJobOwned(job)
 	}
 	return nil
 }
@@ -506,12 +536,17 @@ func (cs *CronScheduler) RemoveJob(id string) bool {
 }
 
 func (cs *CronScheduler) EnableJob(id string) error {
+	done, ok := cs.beginTask()
+	if !ok {
+		return ErrCronSchedulerStopped
+	}
+	defer done()
 	if !cs.store.SetEnabled(id, true) {
 		return fmt.Errorf("job %q not found", id)
 	}
 	job := cs.store.Get(id)
 	if job != nil {
-		return cs.scheduleJob(job)
+		return cs.scheduleJobOwned(job)
 	}
 	return nil
 }
@@ -532,6 +567,11 @@ func (cs *CronScheduler) DisableJob(id string) error {
 // UpdateJob modifies a field of a cron job and reschedules if necessary.
 // Returns error if job not found, field is read-only, or value is invalid.
 func (cs *CronScheduler) UpdateJob(id string, field string, value any) error {
+	done, ok := cs.beginTask()
+	if !ok {
+		return ErrCronSchedulerStopped
+	}
+	defer done()
 	job := cs.store.Get(id)
 	if job == nil {
 		return fmt.Errorf("job %q not found", id)
@@ -602,7 +642,7 @@ func (cs *CronScheduler) UpdateJob(id string, field string, value any) error {
 	if needsReschedule {
 		updatedJob := cs.store.Get(id)
 		if updatedJob != nil && updatedJob.Enabled {
-			if err := cs.scheduleJob(updatedJob); err != nil {
+			if err := cs.scheduleJobOwned(updatedJob); err != nil {
 				return fmt.Errorf("reschedule failed: %w", err)
 			}
 		}
@@ -632,6 +672,15 @@ func (cs *CronScheduler) NextRun(jobID string) time.Time {
 }
 
 func (cs *CronScheduler) scheduleJob(job *CronJob) error {
+	done, ok := cs.beginTask()
+	if !ok {
+		return ErrCronSchedulerStopped
+	}
+	defer done()
+	return cs.scheduleJobOwned(job)
+}
+
+func (cs *CronScheduler) scheduleJobOwned(job *CronJob) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
@@ -662,22 +711,50 @@ func (cs *CronScheduler) executeJob(jobID string) {
 // RunJobNow triggers a persisted cron job immediately in the background.
 // Disabled jobs are allowed to run manually; only scheduled executions enforce Enabled.
 func (cs *CronScheduler) RunJobNow(id string) error {
+	done, ok := cs.beginTask()
+	if !ok {
+		return ErrCronSchedulerStopped
+	}
 	job := cs.store.Get(id)
 	if job == nil {
+		done()
 		return fmt.Errorf("%w: %q", ErrCronJobNotFound, id)
 	}
 	cs.mu.RLock()
-	_, ok := cs.engines[job.Project]
+	_, ok = cs.engines[job.Project]
 	cs.mu.RUnlock()
 	if !ok {
+		done()
 		return fmt.Errorf("%w: %q", ErrCronProjectNotFound, job.Project)
 	}
 	snapshot := *job
-	go cs.runJob(&snapshot, true)
+	go func() {
+		defer done()
+		cs.runJobOwned(&snapshot, true)
+	}()
 	return nil
 }
 
 func (cs *CronScheduler) runJob(job *CronJob, manual bool) {
+	done, ok := cs.beginTask()
+	if !ok {
+		return
+	}
+	defer done()
+	cs.runJobOwned(job, manual)
+}
+
+func (cs *CronScheduler) beginTask() (done func(), ok bool) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if cs.stopping {
+		return nil, false
+	}
+	cs.runs.Add(1)
+	return cs.runs.Done, true
+}
+
+func (cs *CronScheduler) runJobOwned(job *CronJob, manual bool) {
 	if job == nil {
 		return
 	}
@@ -697,21 +774,19 @@ func (cs *CronScheduler) runJob(job *CronJob, manual bool) {
 
 	slog.Info("cron: executing job", "id", job.ID, "project", job.Project, "manual", manual, "prompt", truncateStr(job.Prompt, 60))
 
-	done := make(chan error, 1)
-	go func() {
-		done <- engine.ExecuteCronJob(job)
-	}()
-
-	var err error
+	runCtx := cs.ctx
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
 	timeout := job.ExecutionTimeout()
+	var cancel context.CancelFunc = func() {}
 	if timeout > 0 {
-		select {
-		case err = <-done:
-		case <-time.After(timeout):
-			err = fmt.Errorf("job timed out after %v", timeout)
-		}
-	} else {
-		err = <-done
+		runCtx, cancel = context.WithTimeout(runCtx, timeout)
+	}
+	defer cancel()
+	err := engine.executeCronJob(runCtx, job)
+	if errors.Is(err, context.DeadlineExceeded) {
+		err = fmt.Errorf("job timed out after %v", timeout)
 	}
 
 	cs.store.MarkRun(job.ID, err)
@@ -731,7 +806,6 @@ type mutePlatform struct {
 
 func (m *mutePlatform) Reply(_ context.Context, _ any, _ string) error { return nil }
 func (m *mutePlatform) Send(_ context.Context, _ any, _ string) error  { return nil }
-
 
 func GenerateCronID() string {
 	b := make([]byte, 4)

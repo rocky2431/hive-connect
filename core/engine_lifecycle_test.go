@@ -2,11 +2,143 @@ package core
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestStoppedEngineRejectsSynchronousSchedulerEntries(t *testing.T) {
+	engine := NewEngine("stopped-scheduler", &stubAgent{}, nil, t.TempDir()+"/sessions.json", LangEnglish)
+	if err := engine.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	if err := engine.ExecuteCronJob(&CronJob{}); !errors.Is(err, ErrEngineStopping) {
+		t.Fatalf("ExecuteCronJob() error = %v, want ErrEngineStopping", err)
+	}
+	if err := engine.ExecuteTimerJob(&TimerJob{}); !errors.Is(err, ErrEngineStopping) {
+		t.Fatalf("ExecuteTimerJob() error = %v, want ErrEngineStopping", err)
+	}
+}
+
+func TestStoppedSchedulersRejectNewExecutionMutations(t *testing.T) {
+	t.Run("cron", func(t *testing.T) {
+		store, err := NewCronStore(t.TempDir())
+		if err != nil {
+			t.Fatalf("NewCronStore: %v", err)
+		}
+		scheduler := NewCronScheduler(store)
+		existing := &CronJob{
+			ID:         "existing",
+			Project:    "project",
+			SessionKey: "test:chat:user",
+			CronExpr:   "0 6 * * *",
+			Prompt:     "hello",
+		}
+		if err := scheduler.AddJob(existing); err != nil {
+			t.Fatalf("AddJob existing: %v", err)
+		}
+		scheduler.Stop()
+
+		late := &CronJob{
+			ID:         "late",
+			Project:    "project",
+			SessionKey: "test:chat:user",
+			CronExpr:   "0 7 * * *",
+			Prompt:     "late",
+		}
+		if err := scheduler.AddJob(late); !errors.Is(err, ErrCronSchedulerStopped) {
+			t.Fatalf("AddJob after Stop error = %v, want ErrCronSchedulerStopped", err)
+		}
+		if store.Get(late.ID) != nil {
+			t.Fatal("stopped CronScheduler persisted an unschedulable job")
+		}
+		if err := scheduler.RunJobNow(existing.ID); !errors.Is(err, ErrCronSchedulerStopped) {
+			t.Fatalf("RunJobNow after Stop error = %v, want ErrCronSchedulerStopped", err)
+		}
+	})
+
+	t.Run("timer", func(t *testing.T) {
+		store, err := NewTimerStore(t.TempDir())
+		if err != nil {
+			t.Fatalf("NewTimerStore: %v", err)
+		}
+		scheduler := NewTimerScheduler(store)
+		future := &TimerJob{
+			ID:          "future",
+			Project:     "project",
+			SessionKey:  "test:chat:user",
+			ScheduledAt: time.Now().Add(time.Hour),
+			Prompt:      "future",
+		}
+		if err := scheduler.AddJob(future); err != nil {
+			t.Fatalf("AddJob future: %v", err)
+		}
+		scheduler.Stop()
+		if persisted := store.Get(future.ID); persisted == nil || persisted.Fired {
+			t.Fatalf("untriggered timer was consumed during Stop: %#v", persisted)
+		}
+		late := &TimerJob{
+			ID:          "late",
+			Project:     "project",
+			SessionKey:  "test:chat:user",
+			ScheduledAt: time.Now().Add(time.Hour),
+			Prompt:      "late",
+		}
+		if err := scheduler.AddJob(late); !errors.Is(err, ErrTimerSchedulerStopped) {
+			t.Fatalf("AddJob after Stop error = %v, want ErrTimerSchedulerStopped", err)
+		}
+		if store.Get(late.ID) != nil {
+			t.Fatal("stopped TimerScheduler persisted an unschedulable job")
+		}
+		scheduler.mu.RLock()
+		_, scheduled := scheduler.timers[late.ID]
+		scheduler.mu.RUnlock()
+		if scheduled {
+			t.Fatal("stopped TimerScheduler retained a late timer")
+		}
+	})
+}
+
+func TestTimerSchedulerStopFailsClosedForActivePromptRun(t *testing.T) {
+	session := newControllableSession("timer-active")
+	started := make(chan struct{})
+	agent := &controllableAgent{startSessionFn: func(context.Context, string) (AgentSession, error) {
+		close(started)
+		return session, nil
+	}}
+	platform := &stubCronReplyTargetPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	engine := NewEngine("timer-prompt", agent, []Platform{platform}, t.TempDir()+"/sessions.json", LangEnglish)
+	defer engine.Stop()
+
+	store, err := NewTimerStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewTimerStore: %v", err)
+	}
+	scheduler := NewTimerScheduler(store)
+	scheduler.RegisterEngine("timer-prompt", engine)
+	job := &TimerJob{
+		ID:          "active-prompt",
+		Project:     "timer-prompt",
+		SessionKey:  "test:chat:user",
+		ScheduledAt: time.Now().Add(10 * time.Millisecond),
+		Prompt:      "work",
+	}
+	if err := scheduler.AddJob(job); err != nil {
+		t.Fatalf("AddJob: %v", err)
+	}
+	waitLifecycleSignal(t, started, "timer prompt start")
+
+	scheduler.Stop()
+	waitLifecycleSignal(t, session.closed, "timer prompt cancellation")
+	persisted := store.Get(job.ID)
+	if persisted == nil || !persisted.Fired || !strings.Contains(persisted.LastError, "interrupted_outcome_unknown") {
+		t.Fatalf("active prompt timer did not fail closed: %#v", persisted)
+	}
+}
 
 // Test Double rationale: Engine shutdown needs observable Agent and Platform
 // boundaries without starting a real provider process or messaging transport.

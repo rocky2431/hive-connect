@@ -1,9 +1,11 @@
 package core
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -40,6 +42,8 @@ func (j *TimerJob) IsShellJob() bool {
 }
 
 const defaultTimerJobTimeout = 30 * time.Minute
+
+var ErrTimerSchedulerStopped = errors.New("timer scheduler is stopped")
 
 // ExecutionTimeout returns how long the scheduler waits for the job goroutine to finish.
 func (j *TimerJob) ExecutionTimeout() time.Duration {
@@ -238,12 +242,17 @@ func (s *TimerStore) ListPending() []*TimerJob {
 
 // TimerScheduler runs one-shot timer jobs using time.AfterFunc.
 type TimerScheduler struct {
-	store    *TimerStore
-	engines  map[string]*Engine
-	mu       sync.RWMutex
-	timers   map[string]*time.Timer // job ID → active timer
+	store              *TimerStore
+	engines            map[string]*Engine
+	mu                 sync.RWMutex
+	timers             map[string]*time.Timer // job ID → active timer
 	defaultSilent      bool
 	defaultSessionMode string
+	ctx                context.Context
+	cancel             context.CancelFunc
+	stopping           bool
+	runs               sync.WaitGroup
+	stopOnce           sync.Once
 }
 
 // missedJobGracePeriod is how long after a missed fire time we still execute.
@@ -251,10 +260,13 @@ type TimerScheduler struct {
 const missedJobGracePeriod = 5 * time.Minute
 
 func NewTimerScheduler(store *TimerStore) *TimerScheduler {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &TimerScheduler{
 		store:   store,
 		engines: make(map[string]*Engine),
 		timers:  make(map[string]*time.Timer),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 }
 
@@ -293,6 +305,11 @@ func (ts *TimerScheduler) UsesNewSession(job *TimerJob) bool {
 }
 
 func (ts *TimerScheduler) Start() error {
+	done, ok := ts.beginTask()
+	if !ok {
+		return ErrTimerSchedulerStopped
+	}
+	defer done()
 	jobs := ts.store.List()
 	now := time.Now()
 	var scheduled, missed, skipped int
@@ -306,7 +323,7 @@ func (ts *TimerScheduler) Start() error {
 			if -delay <= missedJobGracePeriod {
 				// Just missed — fire immediately
 				slog.Info("timer: firing missed job immediately", "id", job.ID, "overdue", -delay)
-				ts.scheduleAt(job, 0)
+				ts.scheduleAtOwned(job, 0)
 				missed++
 			} else {
 				slog.Warn("timer: skipping stale job", "id", job.ID, "scheduled_at", job.ScheduledAt, "overdue", -delay)
@@ -314,7 +331,7 @@ func (ts *TimerScheduler) Start() error {
 				skipped++
 			}
 		} else {
-			ts.scheduleAt(job, delay)
+			ts.scheduleAtOwned(job, delay)
 			scheduled++
 		}
 	}
@@ -323,15 +340,30 @@ func (ts *TimerScheduler) Start() error {
 }
 
 func (ts *TimerScheduler) Stop() {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	for id, t := range ts.timers {
-		t.Stop()
-		delete(ts.timers, id)
-	}
+	ts.stopOnce.Do(func() {
+		ts.mu.Lock()
+		ts.stopping = true
+		cancel := ts.cancel
+		ts.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		ts.runs.Wait()
+		ts.mu.Lock()
+		for id, timer := range ts.timers {
+			timer.Stop()
+			delete(ts.timers, id)
+		}
+		ts.mu.Unlock()
+	})
 }
 
 func (ts *TimerScheduler) AddJob(job *TimerJob) error {
+	done, ok := ts.beginTask()
+	if !ok {
+		return ErrTimerSchedulerStopped
+	}
+	defer done()
 	if err := validateTimerJob(job); err != nil {
 		return err
 	}
@@ -343,9 +375,9 @@ func (ts *TimerScheduler) AddJob(job *TimerJob) error {
 	if delay <= 0 {
 		// Already due — fire immediately
 		slog.Info("timer: new job already due, firing immediately", "id", job.ID)
-		ts.scheduleAt(job, 0)
+		ts.scheduleAtOwned(job, 0)
 	} else {
-		ts.scheduleAt(job, delay)
+		ts.scheduleAtOwned(job, delay)
 	}
 	return nil
 }
@@ -373,6 +405,15 @@ func (ts *TimerScheduler) Store() *TimerStore {
 }
 
 func (ts *TimerScheduler) scheduleAt(job *TimerJob, delay time.Duration) {
+	done, ok := ts.beginTask()
+	if !ok {
+		return
+	}
+	defer done()
+	ts.scheduleAtOwned(job, delay)
+}
+
+func (ts *TimerScheduler) scheduleAtOwned(job *TimerJob, delay time.Duration) {
 	jobID := job.ID
 	ts.mu.Lock()
 	// Stop any existing timer for this job
@@ -395,6 +436,11 @@ func (ts *TimerScheduler) executeJob(jobID string) {
 	if job == nil || job.Fired {
 		return
 	}
+	done, ok := ts.beginTask()
+	if !ok {
+		return
+	}
+	defer done()
 
 	ts.mu.RLock()
 	engine, ok := ts.engines[job.Project]
@@ -408,23 +454,24 @@ func (ts *TimerScheduler) executeJob(jobID string) {
 
 	slog.Info("timer: executing job", "id", jobID, "project", job.Project, "prompt", truncateStr(job.Prompt, 60))
 
-	done := make(chan error, 1)
-	go func() {
-		done <- engine.ExecuteTimerJob(job)
-	}()
-
-	var err error
+	runCtx := ts.ctx
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
 	timeout := job.ExecutionTimeout()
+	var cancel context.CancelFunc = func() {}
 	if timeout > 0 {
-		select {
-		case err = <-done:
-		case <-time.After(timeout):
-			err = fmt.Errorf("job timed out after %v", timeout)
-		}
-	} else {
-		err = <-done
+		runCtx, cancel = context.WithTimeout(runCtx, timeout)
+	}
+	defer cancel()
+	err := engine.executeTimerJob(runCtx, job)
+	if errors.Is(err, context.DeadlineExceeded) {
+		err = fmt.Errorf("job timed out after %v", timeout)
 	}
 
+	if errors.Is(err, context.Canceled) && ts.isStopping() {
+		err = errors.New("interrupted_outcome_unknown: timer execution was interrupted during shutdown and will not be repeated automatically")
+	}
 	ts.store.MarkFired(jobID, err)
 
 	if err != nil {
@@ -432,6 +479,22 @@ func (ts *TimerScheduler) executeJob(jobID string) {
 	} else {
 		slog.Info("timer: job completed", "id", jobID)
 	}
+}
+
+func (ts *TimerScheduler) beginTask() (done func(), ok bool) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if ts.stopping {
+		return nil, false
+	}
+	ts.runs.Add(1)
+	return ts.runs.Done, true
+}
+
+func (ts *TimerScheduler) isStopping() bool {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return ts.stopping
 }
 
 func GenerateTimerID() string {

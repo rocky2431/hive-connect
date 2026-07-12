@@ -30,6 +30,8 @@ const maxPlatformMessageLen = 4000
 const telegramBotCommandLimit = 100
 const defaultMaxQueuedMessages = 5 // default cap for queued messages per session
 
+var ErrEngineStopping = errors.New("engine is stopping")
+
 // defaultPendingRestartTimeout is how long the post-restart notify
 // dispatcher waits for the target platform to reach ready before
 // dropping the notify with a warning. 10s covers the typical 2-3s
@@ -1369,6 +1371,24 @@ func (e *Engine) ActiveSessionKeys() []string {
 // It finds the platform that owns the session key, reconstructs a reply context,
 // and processes the message as if the user sent it.
 func (e *Engine) ExecuteCronJob(job *CronJob) error {
+	return e.executeCronJob(e.ctx, job)
+}
+
+func (e *Engine) executeCronJob(runCtx context.Context, job *CronJob) error {
+	done, ok := e.beginLifecycleTask()
+	if !ok {
+		return ErrEngineStopping
+	}
+	defer done()
+	if job == nil {
+		return errors.New("cron job is required")
+	}
+	runCtx, cancelRun := e.lifecycleRunContext(runCtx)
+	defer cancelRun()
+	if err := runCtx.Err(); err != nil {
+		return err
+	}
+
 	e.hooks.Emit(HookEvent{
 		Event:      HookEventCronTriggered,
 		SessionKey: job.SessionKey,
@@ -1467,7 +1487,7 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	}
 
 	if job.IsShellJob() {
-		return e.executeCronShell(effectivePlatform, replyCtx, job)
+		return e.executeCronShell(runCtx, effectivePlatform, replyCtx, job)
 	}
 
 	content := job.Prompt
@@ -1542,8 +1562,11 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 			iKey = workspaceDir + ":" + iKey
 		}
 		prevHistLen := session.HistoryLen()
-		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey)
+		e.processInteractiveMessageWithContext(runCtx, effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey)
 		e.cleanupInteractiveState(iKey)
+		if err := runCtx.Err(); err != nil {
+			return err
+		}
 		// Empty-response detection via session history delta: processInteractiveMessageWith
 		// always adds a "user" entry (prevHistLen+1), then an "assistant" entry on success
 		// (prevHistLen+2). This approach correctly detects empty responses across all
@@ -1565,7 +1588,10 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		iKey = workspaceDir + ":" + sessionKey
 	}
 	prevHistLen := session.HistoryLen()
-	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey)
+	e.processInteractiveMessageWithContext(runCtx, effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey)
+	if err := runCtx.Err(); err != nil {
+		return err
+	}
 	// Same empty-response detection as the useNewSession path above.
 	if !job.Mute && session.HistoryLen() < prevHistLen+2 {
 		return fmt.Errorf("cron job %q produced an empty response", job.ID)
@@ -1577,6 +1603,24 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 // notification (unless muted), and either runs a shell command or injects a
 // synthetic message into the agent session.
 func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
+	return e.executeTimerJob(e.ctx, job)
+}
+
+func (e *Engine) executeTimerJob(runCtx context.Context, job *TimerJob) error {
+	done, ok := e.beginLifecycleTask()
+	if !ok {
+		return ErrEngineStopping
+	}
+	defer done()
+	if job == nil {
+		return errors.New("timer job is required")
+	}
+	runCtx, cancelRun := e.lifecycleRunContext(runCtx)
+	defer cancelRun()
+	if err := runCtx.Err(); err != nil {
+		return err
+	}
+
 	e.hooks.Emit(HookEvent{
 		Event:      HookEventTimerTriggered,
 		SessionKey: job.SessionKey,
@@ -1670,7 +1714,7 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 	}
 
 	if job.IsShellJob() {
-		return e.executeTimerShell(effectivePlatform, replyCtx, job)
+		return e.executeTimerShell(runCtx, effectivePlatform, replyCtx, job)
 	}
 
 	content := job.Prompt
@@ -1742,8 +1786,11 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 		if workspaceDir != "" {
 			iKey = workspaceDir + ":" + iKey
 		}
-		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey)
+		e.processInteractiveMessageWithContext(runCtx, effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey)
 		e.cleanupInteractiveState(iKey)
+		if err := runCtx.Err(); err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -1756,7 +1803,10 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 	if workspaceDir != "" {
 		iKey = workspaceDir + ":" + sessionKey
 	}
-	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey)
+	e.processInteractiveMessageWithContext(runCtx, effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey)
+	if err := runCtx.Err(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1774,7 +1824,7 @@ func timerRunTitle(job *TimerJob) string {
 }
 
 // executeTimerShell runs a shell command for a timer job and sends the output.
-func (e *Engine) executeTimerShell(p Platform, replyCtx any, job *TimerJob) error {
+func (e *Engine) executeTimerShell(runCtx context.Context, p Platform, replyCtx any, job *TimerJob) error {
 	workDir := job.WorkDir
 	if workDir == "" {
 		if wd, ok := e.agent.(interface{ GetWorkDir() string }); ok {
@@ -1792,15 +1842,10 @@ func (e *Engine) executeTimerShell(p Platform, replyCtx any, job *TimerJob) erro
 
 	cmdLabel := truncateStr(job.Exec, 60)
 
-	ctx, cancel := context.WithTimeout(e.ctx, timeout)
+	ctx, cancel := context.WithTimeout(runCtx, timeout)
 	defer cancel()
 
-	var shellCmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		shellCmd = exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", job.Exec)
-	} else {
-		shellCmd = exec.CommandContext(ctx, "sh", "-c", job.Exec)
-	}
+	shellCmd := shellExecCommand(ctx, e.shell, e.shellFlag, e.shellProfile, job.Exec)
 	shellCmd.Dir = workDir
 
 	stdout, err := shellCmd.StdoutPipe()
@@ -1857,6 +1902,9 @@ func (e *Engine) executeTimerShell(p Platform, replyCtx any, job *TimerJob) erro
 			msg = fmt.Sprintf("⏰ ⚠️ timeout: `%s`\n\n%s", cmdLabel, truncateStr(output, 3000))
 		}
 		e.send(p, replyCtx, msg)
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return context.Canceled
+		}
 		return fmt.Errorf("shell command timed out")
 	case <-time.After(quickFinishTimeout):
 	}
@@ -1928,6 +1976,9 @@ func (e *Engine) executeTimerShell(p Platform, replyCtx any, job *TimerJob) erro
 		} else {
 			e.send(p, replyCtx, msg)
 		}
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return context.Canceled
+		}
 		return fmt.Errorf("shell command timed out")
 	}
 }
@@ -1952,7 +2003,7 @@ func cronRunTitle(job *CronJob) string {
 }
 
 // executeCronShell runs a shell command for a cron job and sends the output.
-func (e *Engine) executeCronShell(p Platform, replyCtx any, job *CronJob) error {
+func (e *Engine) executeCronShell(runCtx context.Context, p Platform, replyCtx any, job *CronJob) error {
 	workDir := job.WorkDir
 	if workDir == "" {
 		if wd, ok := e.agent.(interface{ GetWorkDir() string }); ok {
@@ -1970,7 +2021,7 @@ func (e *Engine) executeCronShell(p Platform, replyCtx any, job *CronJob) error 
 
 	cmdLabel := truncateStr(job.Exec, 60)
 
-	ctx, cancel := context.WithTimeout(e.ctx, timeout)
+	ctx, cancel := context.WithTimeout(runCtx, timeout)
 	defer cancel()
 
 	shellCmd := shellExecCommand(ctx, e.shell, e.shellFlag, e.shellProfile, job.Exec)
@@ -2035,6 +2086,9 @@ func (e *Engine) executeCronShell(p Platform, replyCtx any, job *CronJob) error 
 			msg = fmt.Sprintf("⏰ ⚠️ timeout: `%s`\n\n%s", cmdLabel, truncateStr(output, 3000))
 		}
 		e.send(p, replyCtx, msg)
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return context.Canceled
+		}
 		return fmt.Errorf("shell command timed out")
 	case <-time.After(quickFinishTimeout):
 		// Still running — fall through to progress mode
@@ -2106,6 +2160,9 @@ func (e *Engine) executeCronShell(p Platform, replyCtx any, job *CronJob) error 
 			_ = updaterFor(p).UpdateMessage(e.ctx, previewHandle, msg)
 		} else {
 			e.send(p, replyCtx, msg)
+		}
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return context.Canceled
 		}
 		return fmt.Errorf("shell command timed out")
 	}
@@ -2370,21 +2427,47 @@ func containsAgent(agents []Agent, candidate Agent) bool {
 	return false
 }
 
-// startLifecycleTask starts an engine-owned task that may persist session or
-// workspace state. The stopping check and WaitGroup.Add share
-// platformLifecycleMu so Wait in Stop can never race a late Add. Callers that
-// already own a Session lock must release it when this returns false.
-func (e *Engine) startLifecycleTask(task func()) bool {
+// beginLifecycleTask claims ownership for synchronous work that may persist
+// session or workspace state. The stopping check and WaitGroup.Add share
+// platformLifecycleMu so Stop.Wait can never race a late Add.
+func (e *Engine) beginLifecycleTask() (done func(), ok bool) {
 	e.platformLifecycleMu.Lock()
 	if e.stopping {
 		e.platformLifecycleMu.Unlock()
-		return false
+		return nil, false
 	}
 	e.lifecycleTasks.Add(1)
 	e.platformLifecycleMu.Unlock()
+	return e.lifecycleTasks.Done, true
+}
+
+func (e *Engine) lifecycleRunContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	engineCtx := e.ctx
+	if engineCtx == nil {
+		engineCtx = context.Background()
+	}
+	stopEngineCancel := context.AfterFunc(engineCtx, cancel)
+	return ctx, func() {
+		stopEngineCancel()
+		cancel()
+	}
+}
+
+// startLifecycleTask is the asynchronous shell around beginLifecycleTask.
+// Callers that already own a Session lock must release it when this returns
+// false.
+func (e *Engine) startLifecycleTask(task func()) bool {
+	done, ok := e.beginLifecycleTask()
+	if !ok {
+		return false
+	}
 
 	go func() {
-		defer e.lifecycleTasks.Done()
+		defer done()
 		task()
 	}()
 	return true
@@ -3037,7 +3120,7 @@ sessionLocked:
 	)
 
 	if !e.startLifecycleTask(func() {
-		e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
+		e.processInteractiveMessageWithContext(e.ctx, p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
 	}) {
 		session.Unlock()
 	}
@@ -3217,7 +3300,7 @@ func (e *Engine) drainOrphanedQueue(session *Session, sessions *SessionManager, 
 	// from Events() and we must not have concurrent readers.
 	e.stopUnsolicitedReader(state)
 
-	unlocked = e.drainPendingMessages(state, session, sessions, interactiveKey)
+	unlocked = e.drainPendingMessages(e.ctx, state, session, sessions, interactiveKey)
 
 	// Restart unsolicited reader if the session is still alive and clean.
 	state.mu.Lock()
@@ -3650,6 +3733,10 @@ func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Se
 // and workspaceDir so that multi-workspace mode can route to per-workspace agents.
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY in the agent env; otherwise interactiveKey is used.
 func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session *Session, agent Agent, sessions *SessionManager, interactiveKey string, workspaceDir string, ccSessionKey string) {
+	e.processInteractiveMessageWithContext(e.ctx, p, msg, session, agent, sessions, interactiveKey, workspaceDir, ccSessionKey)
+}
+
+func (e *Engine) processInteractiveMessageWithContext(runCtx context.Context, p Platform, msg *Message, session *Session, agent Agent, sessions *SessionManager, interactiveKey string, workspaceDir string, ccSessionKey string) {
 	// session.Unlock() is NOT deferred here — it is called explicitly in
 	// the drain loop below while holding state.mu to close the race window
 	// between "queue is empty" and "session unlocked". A deferred fallback
@@ -3661,7 +3748,13 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		}
 	}()
 
-	if e.ctx.Err() != nil {
+	if runCtx == nil {
+		runCtx = e.ctx
+	}
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
+	if runCtx.Err() != nil || (e.ctx != nil && e.ctx.Err() != nil) {
 		return
 	}
 
@@ -3760,17 +3853,21 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	state.currentMessageID = msg.MessageID
 	state.fromVoice = msg.FromVoice
 	state.sideText = ""
+	agentSession := state.agentSession
 	state.mu.Unlock()
+	if agentSession == nil {
+		return
+	}
 
 	// Run Send concurrently with processInteractiveEvents. Some agents block inside
 	// Send until the prompt turn finishes (e.g. ACP session/prompt); they may emit
 	// EventPermissionRequest while blocked — the event loop must run in parallel.
 	sendDone := make(chan error, 1)
 	go func() {
-		sendDone <- state.agentSession.Send(promptContent, msg.Images, msg.Files)
+		sendDone <- agentSession.Send(promptContent, msg.Images, msg.Files)
 	}()
 
-	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx)
+	e.processInteractiveEventsWithContext(runCtx, state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx)
 	if elapsed := time.Since(sendStart); elapsed >= slowAgentSend {
 		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
 	}
@@ -3780,7 +3877,11 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	// processInteractiveEvents observing an empty queue and returning here
 	// (session is still locked, so handleMessage's TryLock fails and routes
 	// the message to queueMessageForBusySession). Drain any such orphans.
-	if e.drainPendingMessages(state, session, sessions, interactiveKey) {
+	if runCtx.Err() != nil {
+		e.notifyDroppedQueuedMessages(state, runCtx.Err())
+		return
+	}
+	if e.drainPendingMessages(runCtx, state, session, sessions, interactiveKey) {
 		unlocked = true
 	}
 
@@ -4595,6 +4696,13 @@ var agentErrorHandlers = []agentErrorHandler{
 }
 
 func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any) {
+	e.processInteractiveEventsWithContext(e.ctx, state, session, sessions, sessionKey, msgID, turnStart, stopTypingFn, sendDone, replyCtx)
+}
+
+func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any) {
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
 	if msgID != "" {
 		state.mu.Lock()
 		state.currentMessageID = msgID
@@ -4700,6 +4808,14 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		var ok bool
 
 		select {
+		case <-runCtx.Done():
+			cp.Finalize(ProgressCardStateFailed)
+			sp.discard()
+			state.mu.Lock()
+			state.eventsNeedResync = true
+			state.mu.Unlock()
+			e.cleanupInteractiveState(sessionKey, state)
+			return
 		case <-stopCh:
 			sp.discard()
 			return
@@ -5994,8 +6110,12 @@ func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason err
 // queue. It atomically unlocks the session when the queue is empty (while holding
 // state.mu) to close the race window between "queue empty" and "session unlocked".
 // Returns true if the session was unlocked by this call.
-func (e *Engine) drainPendingMessages(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string) bool {
+func (e *Engine) drainPendingMessages(runCtx context.Context, state *interactiveState, session *Session, sessions *SessionManager, sessionKey string) bool {
 	for {
+		if runCtx != nil && runCtx.Err() != nil {
+			e.notifyDroppedQueuedMessages(state, runCtx.Err())
+			return false
+		}
 		state.mu.Lock()
 		if len(state.pendingMessages) == 0 {
 			session.Unlock()
@@ -6051,7 +6171,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		}
 
 		slog.Info("processing queued message", "session", sessionKey)
-		e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx)
+		e.processInteractiveEventsWithContext(runCtx, state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx)
 	}
 }
 
@@ -7536,10 +7656,14 @@ func shellExecCommand(ctx context.Context, shell, flag, shellProfile, command st
 		command = shellProfile + "\n" + command
 	}
 	base := strings.ToLower(filepath.Base(shell))
+	var cmd *exec.Cmd
 	if strings.HasPrefix(base, "powershell") || strings.HasPrefix(base, "pwsh") {
-		return exec.CommandContext(ctx, shell, "-NoProfile", "-ExecutionPolicy", "Bypass", flag, command)
+		cmd = exec.CommandContext(ctx, shell, "-NoProfile", "-ExecutionPolicy", "Bypass", flag, command)
+	} else {
+		cmd = exec.CommandContext(ctx, shell, flag, command)
 	}
-	return exec.CommandContext(ctx, shell, flag, command)
+	configureShellProcessTree(cmd)
+	return cmd
 }
 
 func defaultShell() string {
@@ -7774,9 +7898,7 @@ func (e *Engine) formatShellTimeout(cmdLabel, output string, maxOutput int) stri
 }
 
 func killAndWait(cmd *exec.Cmd, doneCh <-chan struct{}) {
-	if cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
+	_ = terminateShellProcessTree(cmd)
 	<-doneCh
 }
 
@@ -7824,10 +7946,9 @@ func (e *Engine) cmdShell(p Platform, msg *Message, raw string) {
 		workDir, _ = os.Getwd()
 	}
 
-	// Shell progress is ephemeral delivery. runShellWithProgress derives its
-	// subprocess context from e.ctx and joins its own pipe readers; it does not
-	// write SessionManager or workspace state, so it is not a lifecycle task.
-	go func() { _ = e.runShellWithProgress(p, msg.ReplyCtx, shellCmd, workDir, timeout, 4000) }()
+	e.startLifecycleTask(func() {
+		_ = e.runShellWithProgress(p, msg.ReplyCtx, shellCmd, workDir, timeout, 4000)
+	})
 }
 
 func (e *Engine) cmdDiff(p Platform, msg *Message, raw string) {
@@ -10174,7 +10295,7 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 // during a /compress operation. It sends each one to the agent and runs the
 // full interactive event loop for it.
 func (e *Engine) drainQueuedMessagesAfterCompress(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, unlocked *bool) {
-	if e.drainPendingMessages(state, session, sessions, sessionKey) {
+	if e.drainPendingMessages(e.ctx, state, session, sessions, sessionKey) {
 		*unlocked = true
 	}
 }
@@ -14299,7 +14420,9 @@ func (e *Engine) executeCustomCommand(p Platform, msg *Message, cmd *CustomComma
 	}
 	// If this is an exec command, run shell command directly
 	if cmd.Exec != "" {
-		go e.executeShellCommand(p, msg, cmd, args)
+		e.startLifecycleTask(func() {
+			e.executeShellCommand(p, msg, cmd, args)
+		})
 		return
 	}
 
@@ -14331,7 +14454,7 @@ func (e *Engine) executeCustomCommand(p Platform, msg *Message, cmd *CustomComma
 
 	msg.Content = prompt
 	if !e.startLifecycleTask(func() {
-		e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey)
+		e.processInteractiveMessageWithContext(e.ctx, p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey)
 	}) {
 		session.Unlock()
 	}
@@ -14563,7 +14686,7 @@ func (e *Engine) executeSkill(p Platform, msg *Message, skill *Skill, args []str
 
 	msg.Content = prompt
 	if !e.startLifecycleTask(func() {
-		e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey)
+		e.processInteractiveMessageWithContext(e.ctx, p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey)
 	}) {
 		session.Unlock()
 	}
