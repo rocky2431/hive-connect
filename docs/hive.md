@@ -57,8 +57,16 @@ go run -tags 'no_web no_feishu no_telegram no_discord no_slack no_dingtalk no_we
 - Local -> Hive final text: a terminal `result` frame is persisted before it is
   sent. If its ACK or connection is lost, the same stored result is replayed
   without invoking the local agent again.
-- Local -> Hive files/images: uploads to `/local-bridge/upload` when possible,
-  then emits `file` or `image` events with artifact metadata.
+- Local -> Hive files/images: an action-bound attachment must first upload to
+  `/local-bridge/upload`. Hive Connect reduces the response to a bounded,
+  JSON-scalar artifact contract, binds that canonical metadata to the exact
+  `message_id` / `replay_key` / `request_hash` receipt, and atomically persists
+  the receipt before emitting a `file` or `image` event. Both the live event and
+  the eventual terminal result expose the same top-level `artifacts` list, so
+  Hive's result consumer can attach the already-created backend artifacts.
+  Action-bound upload failure is returned as an error rather than being
+  misreported as a successful, non-durable inline event. Session-only proactive
+  messages without a cloud message binding retain the inline fallback.
 - Presence: the WebSocket `ready` frame marks the runner online in Hive.
 - Auth: all HTTP calls use `Authorization: Bearer <hb_token>`.
 
@@ -73,9 +81,26 @@ go run -tags 'no_web no_feishu no_telegram no_discord no_slack no_dingtalk no_we
 - If the process restarts with a claim but no terminal result, Hive Connect does
   not guess whether a local side effect happened. It returns
   `local_execution_outcome_unknown` and requires a new approved Hive action
-  with a new replay key.
+  with a new replay key. Any artifact metadata committed to the receipt before
+  the restart is included in that recovered result, so the artifact remains
+  consumable even though the execution outcome is unknown.
+- Repeated attachment callbacks canonicalize to the same metadata hash and do
+  not duplicate receipt artifacts. A terminal receipt rejects late artifact
+  additions. Artifact metadata is capped at 64 entries, 16 KiB per entry and
+  scalar allowlisted fields; preview bodies, internal snapshot paths and
+  unknown response extensions are not copied into the receipt or event.
 - Missing/tampered replay metadata and corrupt receipt files fail closed. The
   local agent is not invoked.
+
+The upload endpoint commits its workspace file, ChatMessage and ChatArtifact
+before returning. There is no false claim of a distributed transaction between
+that backend commit and the local receipt write: a process crash in the narrow
+post-commit/pre-receipt window can leave the artifact visible through the
+backend Workspace/ChatArtifact facts but not associated with this action's
+result. The durable execution claim still fails closed after restart and does
+not repeat the action. Normal upload responses, event disconnects, result
+disconnects and restarts after the receipt write preserve the exact action
+association and replay it.
 
 By default, receipts live below
 `<data_dir>/hive/execution-receipts/` in a backend/project/device-specific file

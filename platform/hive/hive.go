@@ -107,18 +107,20 @@ type hiveAttachmentPayload struct {
 }
 
 type replyContext struct {
-	SessionID string
-	MessageID string
-	ReplayKey string
+	SessionID   string
+	MessageID   string
+	ReplayKey   string
+	RequestHash string
 }
 
 type resultFrame struct {
-	Type      string `json:"type"`
-	SessionID string `json:"session_id"`
-	MessageID string `json:"message_id"`
-	Status    string `json:"status"`
-	Output    string `json:"output,omitempty"`
-	ErrorCode string `json:"error_code,omitempty"`
+	Type      string           `json:"type"`
+	SessionID string           `json:"session_id"`
+	MessageID string           `json:"message_id"`
+	Status    string           `json:"status"`
+	Output    string           `json:"output,omitempty"`
+	ErrorCode string           `json:"error_code,omitempty"`
+	Artifacts []map[string]any `json:"artifacts,omitempty"`
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -226,7 +228,7 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 	if p.receipts == nil {
 		return errors.New("hive: execution receipt store is unavailable")
 	}
-	result, err := p.receipts.complete(rc.ReplayKey, rc.MessageID, resultFrame{
+	result, err := p.receipts.complete(rc.ReplayKey, rc.MessageID, rc.RequestHash, resultFrame{
 		Type:      "result",
 		SessionID: rc.SessionID,
 		MessageID: rc.MessageID,
@@ -252,6 +254,13 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 }
 
 func (p *Platform) SendImage(ctx context.Context, rctx any, img core.ImageAttachment) error {
+	rc, err := replyContextFromAny(rctx)
+	if err != nil {
+		return err
+	}
+	if err := p.validateArtifactReplyContext(rc); err != nil {
+		return err
+	}
 	payload := map[string]any{
 		"filename":  fallbackFileName(img.FileName, "image"),
 		"mime_type": firstNonEmptyString(img.MimeType, "application/octet-stream"),
@@ -260,15 +269,31 @@ func (p *Platform) SendImage(ctx context.Context, rctx any, img core.ImageAttach
 	if len(img.Data) <= maxInlineAttachment {
 		payload["data"] = base64.StdEncoding.EncodeToString(img.Data)
 	}
-	if artifact, err := p.uploadAttachment(ctx, payload["filename"].(string), payload["mime_type"].(string), img.Data); err == nil {
-		payload["artifact"] = artifact
+	if upload, err := p.uploadAttachment(ctx, payload["filename"].(string), payload["mime_type"].(string), img.Data); err == nil {
+		artifacts, normalizeErr := bindUploadArtifacts(payload, upload)
+		if normalizeErr != nil {
+			return normalizeErr
+		}
+		if err := p.persistReplyArtifacts(rc, artifacts); err != nil {
+			return err
+		}
 	} else {
+		if rc.MessageID != "" {
+			return fmt.Errorf("hive: durable image upload failed: %w", err)
+		}
 		slog.Warn("hive: image upload failed, falling back to event payload", "error", err)
 	}
-	return p.sendEvent(ctx, rctx, "image", payload)
+	return p.sendEvent(ctx, rc, "image", payload)
 }
 
 func (p *Platform) SendFile(ctx context.Context, rctx any, file core.FileAttachment) error {
+	rc, err := replyContextFromAny(rctx)
+	if err != nil {
+		return err
+	}
+	if err := p.validateArtifactReplyContext(rc); err != nil {
+		return err
+	}
 	payload := map[string]any{
 		"filename":  fallbackFileName(file.FileName, "file"),
 		"mime_type": firstNonEmptyString(file.MimeType, "application/octet-stream"),
@@ -277,12 +302,21 @@ func (p *Platform) SendFile(ctx context.Context, rctx any, file core.FileAttachm
 	if len(file.Data) <= maxInlineAttachment {
 		payload["data"] = base64.StdEncoding.EncodeToString(file.Data)
 	}
-	if artifact, err := p.uploadAttachment(ctx, payload["filename"].(string), payload["mime_type"].(string), file.Data); err == nil {
-		payload["artifact"] = artifact
+	if upload, err := p.uploadAttachment(ctx, payload["filename"].(string), payload["mime_type"].(string), file.Data); err == nil {
+		artifacts, normalizeErr := bindUploadArtifacts(payload, upload)
+		if normalizeErr != nil {
+			return normalizeErr
+		}
+		if err := p.persistReplyArtifacts(rc, artifacts); err != nil {
+			return err
+		}
 	} else {
+		if rc.MessageID != "" {
+			return fmt.Errorf("hive: durable file upload failed: %w", err)
+		}
 		slog.Warn("hive: file upload failed, falling back to event payload", "error", err)
 	}
-	return p.sendEvent(ctx, rctx, "file", payload)
+	return p.sendEvent(ctx, rc, "file", payload)
 }
 
 func (p *Platform) connect(ctx context.Context) error {
@@ -547,7 +581,7 @@ func (p *Platform) handleMessage(payload hiveMessagePayload) {
 			p.handler(p, msg)
 			return
 		}
-		result, completeErr := p.receipts.complete(payload.ReplayKey, payload.ID, resultFrame{
+		result, completeErr := p.receipts.complete(payload.ReplayKey, payload.ID, payload.RequestHash, resultFrame{
 			Type:      "result",
 			SessionID: payload.SessionID,
 			MessageID: payload.ID,
@@ -707,9 +741,10 @@ func coreMessageFromHive(payload hiveMessagePayload) (*core.Message, error) {
 		ExtraContent: extra,
 		ChannelKey:   payload.SessionID,
 		ReplyCtx: replyContext{
-			SessionID: payload.SessionID,
-			MessageID: payload.ID,
-			ReplayKey: payload.ReplayKey,
+			SessionID:   payload.SessionID,
+			MessageID:   payload.ID,
+			ReplayKey:   payload.ReplayKey,
+			RequestHash: payload.RequestHash,
 		},
 	}, nil
 }
@@ -767,6 +802,79 @@ func replyContextFromAny(rctx any) (replyContext, error) {
 	default:
 		return replyContext{}, fmt.Errorf("hive: invalid reply context type %T", rctx)
 	}
+}
+
+func (p *Platform) validateArtifactReplyContext(rc replyContext) error {
+	if rc.MessageID == "" {
+		return nil
+	}
+	if p.receipts == nil {
+		return errors.New("hive: execution receipt store is unavailable")
+	}
+	if err := p.receipts.validateActiveBinding(rc.ReplayKey, rc.MessageID, rc.RequestHash); err != nil {
+		return fmt.Errorf("hive: validate artifact receipt binding: %w", err)
+	}
+	return nil
+}
+
+func (p *Platform) persistReplyArtifacts(rc replyContext, artifacts []map[string]any) error {
+	if rc.MessageID == "" {
+		return nil
+	}
+	if err := p.receipts.appendArtifacts(rc.ReplayKey, rc.MessageID, rc.RequestHash, artifacts); err != nil {
+		return fmt.Errorf("hive: persist artifact receipt binding: %w", err)
+	}
+	return nil
+}
+
+func artifactsFromUploadResponse(upload map[string]any) ([]map[string]any, error) {
+	rawItems, ok := upload["artifacts"]
+	if !ok {
+		return nil, errors.New("hive: upload response omitted artifacts")
+	}
+	var items []any
+	switch typed := rawItems.(type) {
+	case []any:
+		items = typed
+	case []map[string]any:
+		items = make([]any, len(typed))
+		for index := range typed {
+			items[index] = typed[index]
+		}
+	default:
+		return nil, errors.New("hive: upload response artifacts must be a list")
+	}
+	if len(items) == 0 || len(items) > maxReceiptArtifacts {
+		return nil, fmt.Errorf("hive: upload response artifact count must be between 1 and %d", maxReceiptArtifacts)
+	}
+	artifacts := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		metadata, ok := item.(map[string]any)
+		if !ok {
+			return nil, errors.New("hive: upload response artifact must be an object")
+		}
+		bounded := make(map[string]any)
+		for key, value := range metadata {
+			if _, allowed := artifactMetadataKeys[key]; allowed {
+				bounded[key] = value
+			}
+		}
+		if _, err := encodeDurableArtifact(bounded); err != nil {
+			return nil, fmt.Errorf("hive: unsafe upload artifact metadata: %w", err)
+		}
+		artifacts = append(artifacts, bounded)
+	}
+	return artifacts, nil
+}
+
+func bindUploadArtifacts(payload, upload map[string]any) ([]map[string]any, error) {
+	artifacts, err := artifactsFromUploadResponse(upload)
+	if err != nil {
+		return nil, err
+	}
+	payload["artifact"] = artifacts[0]
+	payload["artifacts"] = artifacts
+	return artifacts, nil
 }
 
 func (p *Platform) uploadAttachment(ctx context.Context, filename, mimeType string, data []byte) (map[string]any, error) {
