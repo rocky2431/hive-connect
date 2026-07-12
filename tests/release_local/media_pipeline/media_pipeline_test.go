@@ -21,10 +21,20 @@ type recordingAgent struct {
 	mu       sync.Mutex
 	session  *recordingSession
 	sessions []*recordingSession
+	recorded chan struct{}
 }
 
 func newRecordingAgent() *recordingAgent {
-	return &recordingAgent{session: newRecordingSession()}
+	agent := &recordingAgent{recorded: make(chan struct{})}
+	agent.session = newRecordingSession(agent.notifyRecord)
+	return agent
+}
+
+func (a *recordingAgent) notifyRecord() {
+	a.mu.Lock()
+	close(a.recorded)
+	a.recorded = make(chan struct{})
+	a.mu.Unlock()
 }
 
 func (a *recordingAgent) Name() string { return "recording-agent" }
@@ -34,7 +44,7 @@ func (a *recordingAgent) StartSession(_ context.Context, sessionID string) (core
 	defer a.mu.Unlock()
 	session := a.session
 	if len(a.sessions) > 0 {
-		session = newRecordingSession()
+		session = newRecordingSession(a.notifyRecord)
 	}
 	session.setID(sessionID)
 	a.sessions = append(a.sessions, session)
@@ -59,10 +69,12 @@ func (a *recordingAgent) Stop() error {
 
 func (a *recordingAgent) waitTotalRecords(t *testing.T, n int) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	for {
 		a.mu.Lock()
 		sessions := append([]*recordingSession(nil), a.sessions...)
+		changed := a.recorded
 		a.mu.Unlock()
 		total := 0
 		for _, session := range sessions {
@@ -73,9 +85,12 @@ func (a *recordingAgent) waitTotalRecords(t *testing.T, n int) {
 		if total >= n {
 			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			t.Fatalf("waiting for %d total Send calls: got %d: %v", n, total, ctx.Err())
+		}
 	}
-	t.Fatalf("timeout waiting for %d total Send calls", n)
 }
 
 type recordingSession struct {
@@ -84,12 +99,20 @@ type recordingSession struct {
 	alive      bool
 	records    []sendRecord
 	events     chan core.Event
+	recorded   chan struct{}
+	onRecord   func()
 	blockFirst bool
 	blocked    bool
 }
 
-func newRecordingSession() *recordingSession {
-	return &recordingSession{alive: true, events: make(chan core.Event, 16)}
+func newRecordingSession(onRecord func()) *recordingSession {
+	session := &recordingSession{
+		alive:    true,
+		events:   make(chan core.Event, 16),
+		recorded: make(chan struct{}),
+		onRecord: onRecord,
+	}
+	return session
 }
 
 func (s *recordingSession) setID(id string) {
@@ -106,8 +129,8 @@ func (s *recordingSession) blockFirstResult() {
 
 func (s *recordingSession) Send(prompt string, images []core.ImageAttachment, files []core.FileAttachment) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if !s.alive {
+		s.mu.Unlock()
 		return errors.New("session closed")
 	}
 	rec := sendRecord{
@@ -116,10 +139,16 @@ func (s *recordingSession) Send(prompt string, images []core.ImageAttachment, fi
 		files:  append([]core.FileAttachment(nil), files...),
 	}
 	s.records = append(s.records, rec)
+	close(s.recorded)
+	s.recorded = make(chan struct{})
 	if !(s.blockFirst && len(s.records) == 1) {
 		s.events <- core.Event{Type: core.EventResult, Content: "media ok", Done: true}
 	} else {
 		s.blocked = true
+	}
+	s.mu.Unlock()
+	if s.onRecord != nil {
+		s.onRecord()
 	}
 	return nil
 }
@@ -171,21 +200,24 @@ func (s *recordingSession) releaseFirstEvent(event core.Event) {
 
 func (s *recordingSession) waitRecords(t *testing.T, n int) []sendRecord {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	for {
 		s.mu.Lock()
 		if len(s.records) >= n {
 			out := append([]sendRecord(nil), s.records...)
 			s.mu.Unlock()
 			return out
 		}
+		got := len(s.records)
+		changed := s.recorded
 		s.mu.Unlock()
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			t.Fatalf("waiting for %d Send calls: got %d: %v", n, got, ctx.Err())
+		}
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	t.Fatalf("timeout waiting for %d Send calls, got %d: %#v", n, len(s.records), s.records)
-	return nil
 }
 
 type mediaPlatform struct {
@@ -194,6 +226,11 @@ type mediaPlatform struct {
 	images   []core.ImageAttachment
 	files    []core.FileAttachment
 	replyCtx []any
+	sent     chan struct{}
+}
+
+func newMediaPlatform() *mediaPlatform {
+	return &mediaPlatform{sent: make(chan struct{})}
 }
 
 func (p *mediaPlatform) Name() string { return "media" }
@@ -206,9 +243,11 @@ func (p *mediaPlatform) Reply(_ context.Context, replyCtx any, content string) e
 }
 func (p *mediaPlatform) Send(_ context.Context, replyCtx any, content string) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.texts = append(p.texts, content)
 	p.replyCtx = append(p.replyCtx, replyCtx)
+	close(p.sent)
+	p.sent = make(chan struct{})
+	p.mu.Unlock()
 	return nil
 }
 func (p *mediaPlatform) SendImage(_ context.Context, replyCtx any, img core.ImageAttachment) error {
@@ -237,49 +276,63 @@ func (p *mediaPlatform) snapshot() (texts []string, images []core.ImageAttachmen
 
 func (p *mediaPlatform) waitTextContaining(t *testing.T, substr string) string {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		texts, _, _, _ := p.snapshot()
-		for _, text := range texts {
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	for {
+		p.mu.Lock()
+		for _, text := range p.texts {
 			if strings.Contains(strings.ToLower(text), strings.ToLower(substr)) {
+				p.mu.Unlock()
 				return text
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		changed := p.sent
+		texts := append([]string(nil), p.texts...)
+		p.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			t.Fatalf("waiting for text containing %q: got %#v: %v", substr, texts, ctx.Err())
+		}
 	}
-	texts, _, _, _ := p.snapshot()
-	t.Fatalf("timeout waiting for text containing %q, got %#v", substr, texts)
-	return ""
 }
 
 func (p *mediaPlatform) waitTextCount(t *testing.T, substr string, want int) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		texts, _, _, _ := p.snapshot()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	for {
+		p.mu.Lock()
 		count := 0
-		for _, text := range texts {
+		for _, text := range p.texts {
 			if strings.Contains(strings.ToLower(text), strings.ToLower(substr)) {
 				count++
 			}
 		}
 		if count >= want {
+			p.mu.Unlock()
 			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		changed := p.sent
+		texts := append([]string(nil), p.texts...)
+		p.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			t.Fatalf("waiting for %d texts containing %q: got %#v: %v", want, substr, texts, ctx.Err())
+		}
 	}
-	texts, _, _, _ := p.snapshot()
-	t.Fatalf("timeout waiting for %d texts containing %q, got %#v", want, substr, texts)
 }
 
 func newMediaEngine(t *testing.T) (*core.Engine, *recordingAgent, *mediaPlatform) {
 	t.Helper()
 	agent := newRecordingAgent()
-	platform := &mediaPlatform{}
+	platform := newMediaPlatform()
 	engine := core.NewEngine("release-media", agent, []core.Platform{platform}, t.TempDir()+"/sessions.json", core.LangEnglish)
 	t.Cleanup(func() {
-		engine.Stop()
-		_ = agent.Stop()
+		if err := engine.Stop(); err != nil {
+			t.Errorf("Engine.Stop() error = %v", err)
+		}
 	})
 	return engine, agent, platform
 }

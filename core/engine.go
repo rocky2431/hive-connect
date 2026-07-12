@@ -158,7 +158,9 @@ func (e *Engine) SetPendingRestartNotify(req *RestartRequest) {
 	// If the target platform is already ready, fire the dispatch on a
 	// goroutine so the caller (main startup) is not blocked. If not yet
 	// ready, OnPlatformReady will pick it up. A safety goroutine drops
-	// the notify after a timeout if the platform never reaches ready.
+	// the notify after a timeout if the platform never reaches ready. This is
+	// delivery-only and never writes SessionManager or workspace state, so its
+	// firedCh remains its completion surface instead of lifecycleTasks.
 	go e.runPendingRestartNotify(req, firedCh)
 }
 
@@ -440,6 +442,9 @@ type Engine struct {
 	platformLifecycleMu sync.Mutex
 	platformReady       map[Platform]bool
 	stopping            bool
+	lifecycleTasks      sync.WaitGroup
+	stopOnce            sync.Once
+	stopErr             error
 	replyFooterMu       sync.Mutex
 	replyFooterUsage    replyFooterUsageCache
 
@@ -752,7 +757,7 @@ func (e *Engine) SetMultiWorkspace(baseDir, bindingStorePath string) {
 	e.workspaceBindings = NewWorkspaceBindingManager(bindingStorePath)
 	e.workspacePool = newWorkspacePool(DefaultWorkspaceIdleTimeout)
 	e.initFlows = make(map[string]*workspaceInitFlow)
-	go e.runIdleReaper()
+	e.startLifecycleTask(e.runIdleReaper)
 }
 
 // SetWorkspaceIdleTimeout overrides the workspace idle reaper timeout.
@@ -789,13 +794,13 @@ func (e *Engine) reapIdleWorkspaces() {
 		return
 	}
 
-	reaped := e.workspacePool.ReapIdle()
+	reaped := e.workspacePool.reapIdleStates()
 	if len(reaped) == 0 {
 		return
 	}
 
 	reapedSet := make(map[string]struct{}, len(reaped))
-	for _, ws := range reaped {
+	for ws := range reaped {
 		reapedSet[ws] = struct{}{}
 	}
 
@@ -816,7 +821,22 @@ func (e *Engine) reapIdleWorkspaces() {
 	for _, target := range targets {
 		e.cleanupInteractiveState(target.key, target.state)
 	}
-	for _, ws := range reaped {
+	retainedAgents := e.lifecycleAgents()
+	var retiredAgents []Agent
+	for _, workspace := range reaped {
+		workspace.mu.Lock()
+		agent := workspace.agent
+		workspace.mu.Unlock()
+		if agent != nil && !containsAgent(retainedAgents, agent) {
+			retiredAgents = appendDistinctAgent(retiredAgents, agent)
+		}
+	}
+	for _, agent := range retiredAgents {
+		if err := agent.Stop(); err != nil {
+			slog.Warn("workspace idle-reap: failed to stop agent", "agent", agent.Name(), "error", err)
+		}
+	}
+	for ws := range reaped {
 		slog.Info("workspace idle-reaped", "workspace", ws)
 	}
 }
@@ -2243,6 +2263,13 @@ func (e *Engine) Start() error {
 }
 
 func (e *Engine) Stop() error {
+	e.stopOnce.Do(func() {
+		e.stopErr = e.stop()
+	})
+	return e.stopErr
+}
+
+func (e *Engine) stop() error {
 	e.platformLifecycleMu.Lock()
 	e.stopping = true
 	e.platformLifecycleMu.Unlock()
@@ -2271,9 +2298,25 @@ func (e *Engine) Stop() error {
 	e.interactiveMu.Unlock()
 
 	for key, state := range states {
-		if state.agentSession != nil {
+		e.stopUnsolicitedReader(state)
+		state.mu.Lock()
+		agentSession := state.agentSession
+		state.mu.Unlock()
+		if agentSession != nil {
 			slog.Debug("engine.Stop: closing agent session", "session", key)
-			state.agentSession.Close()
+			agentSession.Close()
+		}
+	}
+
+	// Lifecycle tasks own SessionManager/workspace persistence. Closing the
+	// live sessions above asks foreground turns to unwind; wait before stopping
+	// their Agent owners so model switches, compaction, and final persistence do
+	// not race Agent.Stop or teardown of the data directory.
+	e.lifecycleTasks.Wait()
+
+	for _, agent := range e.lifecycleAgents() {
+		if err := agent.Stop(); err != nil {
+			errs = append(errs, fmt.Errorf("stop agent %s: %w", agent.Name(), err))
 		}
 	}
 
@@ -2286,13 +2329,65 @@ func (e *Engine) Stop() error {
 	}
 	e.userRolesMu.Unlock()
 
-	if err := e.agent.Stop(); err != nil {
-		errs = append(errs, fmt.Errorf("stop agent %s: %w", e.agent.Name(), err))
-	}
 	if len(errs) > 0 {
 		return fmt.Errorf("engine stop errors: %v", errs)
 	}
 	return nil
+}
+
+func (e *Engine) lifecycleAgents() []Agent {
+	agents := appendDistinctAgent(nil, e.agent)
+	if e.workspacePool == nil {
+		return agents
+	}
+	for _, workspace := range e.workspacePool.All() {
+		workspace.mu.Lock()
+		agent := workspace.agent
+		workspace.mu.Unlock()
+		agents = appendDistinctAgent(agents, agent)
+	}
+	return agents
+}
+
+func appendDistinctAgent(agents []Agent, candidate Agent) []Agent {
+	if candidate == nil {
+		return agents
+	}
+	for _, existing := range agents {
+		if existing == candidate {
+			return agents
+		}
+	}
+	return append(agents, candidate)
+}
+
+func containsAgent(agents []Agent, candidate Agent) bool {
+	for _, agent := range agents {
+		if agent == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+// startLifecycleTask starts an engine-owned task that may persist session or
+// workspace state. The stopping check and WaitGroup.Add share
+// platformLifecycleMu so Wait in Stop can never race a late Add. Callers that
+// already own a Session lock must release it when this returns false.
+func (e *Engine) startLifecycleTask(task func()) bool {
+	e.platformLifecycleMu.Lock()
+	if e.stopping {
+		e.platformLifecycleMu.Unlock()
+		return false
+	}
+	e.lifecycleTasks.Add(1)
+	e.platformLifecycleMu.Unlock()
+
+	go func() {
+		defer e.lifecycleTasks.Done()
+		task()
+	}()
+	return true
 }
 
 // OnPlatformReady marks an async platform as ready and initializes platform-level
@@ -2905,7 +3000,11 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 			// and the queue append. Re-try TryLock — if it succeeds, no one is
 			// draining the queue so we must start a processor ourselves.
 			if session.TryLock() {
-				go e.drainOrphanedQueue(session, sessions, interactiveKey, agent, resolvedWorkspace)
+				if !e.startLifecycleTask(func() {
+					e.drainOrphanedQueue(session, sessions, interactiveKey, agent, resolvedWorkspace)
+				}) {
+					session.Unlock()
+				}
 			}
 			return
 		}
@@ -2937,7 +3036,11 @@ sessionLocked:
 		"session", session.ID,
 	)
 
-	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
+	if !e.startLifecycleTask(func() {
+		e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
+	}) {
+		session.Unlock()
+	}
 }
 
 func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions *SessionManager, interactiveKey string, session *Session) *Session {
@@ -4114,7 +4217,14 @@ func (e *Engine) closeAgentSessionAsync(sessionKey string, agentSession AgentSes
 	if agentSession == nil {
 		return
 	}
-	go e.closeAgentSessionWithTimeout(sessionKey, agentSession)
+	if !e.startLifecycleTask(func() {
+		e.closeAgentSessionWithTimeout(sessionKey, agentSession)
+	}) {
+		// A concurrent Stop may have already closed the lifecycle gate after
+		// this session was removed from interactiveStates. Close synchronously
+		// so it cannot escape both the state snapshot and lifecycleTasks.
+		e.closeAgentSessionWithTimeout(sessionKey, agentSession)
+	}
 }
 
 func (e *Engine) closeAgentSessionWithTimeout(sessionKey string, agentSession AgentSession) {
@@ -4255,7 +4365,22 @@ func (e *Engine) startUnsolicitedReader(state *interactiveState, session *Sessio
 	state.unsolicitedDone = done
 	state.mu.Unlock()
 
-	go e.runUnsolicitedReader(ctx, cancel, done, state, agentSession, session, sessions, sessionKey, workspaceDir)
+	if e.startLifecycleTask(func() {
+		e.runUnsolicitedReader(ctx, cancel, done, state, agentSession, session, sessions, sessionKey, workspaceDir)
+	}) {
+		return
+	}
+
+	// Shutdown won the lifecycle race after the reader state was installed.
+	// No goroutine owns done in this branch, so unwind the state synchronously.
+	cancel()
+	state.mu.Lock()
+	if state.unsolicitedDone == done {
+		state.unsolicitedCancel = nil
+		state.unsolicitedDone = nil
+	}
+	state.mu.Unlock()
+	close(done)
 }
 
 // runUnsolicitedReader is the goroutine body for the unsolicited event reader.
@@ -7699,6 +7824,9 @@ func (e *Engine) cmdShell(p Platform, msg *Message, raw string) {
 		workDir, _ = os.Getwd()
 	}
 
+	// Shell progress is ephemeral delivery. runShellWithProgress derives its
+	// subprocess context from e.ctx and joins its own pipe readers; it does not
+	// write SessionManager or workspace state, so it is not a lifecycle task.
 	go func() { _ = e.runShellWithProgress(p, msg.ReplyCtx, shellCmd, workDir, timeout, 4000) }()
 }
 
@@ -9869,9 +9997,12 @@ func (e *Engine) cmdCompress(p Platform, msg *Message) {
 		return
 	}
 
-	e.send(p, msg.ReplyCtx, e.i18n.T(MsgCompressing))
-
-	go e.runCompress(state, session, sessions, iKey, p, msg.ReplyCtx, false)
+	if !e.startLifecycleTask(func() {
+		e.send(p, msg.ReplyCtx, e.i18n.T(MsgCompressing))
+		e.runCompress(state, session, sessions, iKey, p, msg.ReplyCtx, false)
+	}) {
+		session.Unlock()
+	}
 }
 
 // runCompress sends the agent's compress command and handles results.
@@ -11748,7 +11879,13 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		state.mu.Lock()
 		state.modelSwitch = &modelSwitchState{phase: "switching", target: target}
 		state.mu.Unlock()
-		go e.performModelSwitchAsync(sessionKey, state, agent, sessions, target)
+		if !e.startLifecycleTask(func() {
+			e.performModelSwitchAsync(sessionKey, state, agent, sessions, target)
+		}) {
+			state.mu.Lock()
+			state.modelSwitch = nil
+			state.mu.Unlock()
+		}
 
 	case "/reasoning":
 		if args == "" {
@@ -12406,7 +12543,13 @@ func (e *Engine) executeDeleteModeAction(sessionKey, args string) {
 		dm.selectedIDs = make(map[string]struct{})
 		dm.phase = "deleting"
 		dm.hint = e.i18n.Tf(MsgDeleteModeDeletingBody, len(ids))
-		go e.performDeleteModeAsync(sessionKey, ids)
+		if !e.startLifecycleTask(func() {
+			e.performDeleteModeAsync(sessionKey, ids)
+		}) {
+			dm.phase = "result"
+			dm.hint = ""
+			dm.result = fmt.Sprintf(e.i18n.T(MsgError), context.Canceled)
+		}
 	case "form-submit":
 		dm.selectedIDs = parseDeleteModeSelectedIDs(fields[1:])
 		if len(dm.selectedIDs) == 0 {
@@ -14187,7 +14330,11 @@ func (e *Engine) executeCustomCommand(p Platform, msg *Message, cmd *CustomComma
 	)
 
 	msg.Content = prompt
-	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey)
+	if !e.startLifecycleTask(func() {
+		e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey)
+	}) {
+		session.Unlock()
+	}
 }
 
 // executeShellCommand runs a shell command and sends the output to the user.
@@ -14415,7 +14562,11 @@ func (e *Engine) executeSkill(p Platform, msg *Message, skill *Skill, args []str
 	)
 
 	msg.Content = prompt
-	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey)
+	if !e.startLifecycleTask(func() {
+		e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey)
+	}) {
+		session.Unlock()
+	}
 }
 
 func (e *Engine) cmdSkills(p Platform, msg *Message) {
@@ -15438,7 +15589,37 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 	}
 
 	var textParts []string
-	for event := range agentSession.Events() {
+	events := agentSession.Events()
+	for {
+		var event Event
+		var ok bool
+		select {
+		case event, ok = <-events:
+			if !ok {
+				agentSession.Close()
+				if ctx.Err() != nil {
+					return relayPartialResponseOrError(ctx.Err(), textParts, fromProject, e.name)
+				}
+				if len(textParts) > 0 {
+					return strings.Join(textParts, ""), nil
+				}
+				return "", fmt.Errorf("relay: agent process exited without response")
+			}
+		case <-ctx.Done():
+			// The caller deadline only bounds foreground waiting. Preserve a
+			// live engine's resumable relay session by draining it under the
+			// lifecycle owner; a stopped engine rejects the task and closes it.
+			if !e.startLifecycleTask(func() {
+				e.drainRelaySession(agentSession, session, sessions, agent.Name(), relaySessionKey)
+			}) {
+				agentSession.Close()
+			}
+			return relayPartialResponseOrError(ctx.Err(), textParts, fromProject, e.name)
+		case <-e.ctx.Done():
+			agentSession.Close()
+			return relayPartialResponseOrError(e.ctx.Err(), textParts, fromProject, e.name)
+		}
+
 		switch event.Type {
 		case EventText:
 			if event.Content != "" {
@@ -15487,26 +15668,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 				UpdatedInput: event.ToolInputRaw,
 			})
 		}
-		if ctx.Err() != nil {
-			// Relay timed out. Let the agent finish its turn in the
-			// background so the session state is saved cleanly and the
-			// session remains resumable for the next relay call.
-			go e.drainRelaySession(agentSession, session, sessions, agent.Name(), relaySessionKey)
-			return relayPartialResponseOrError(ctx.Err(), textParts, fromProject, e.name)
-		}
 	}
-
-	// Event channel closed without EventResult.
-	agentSession.Close()
-
-	if ctx.Err() != nil {
-		return relayPartialResponseOrError(ctx.Err(), textParts, fromProject, e.name)
-	}
-
-	if len(textParts) > 0 {
-		return strings.Join(textParts, ""), nil
-	}
-	return "", fmt.Errorf("relay: agent process exited without response")
 }
 
 func relayPartialResponseOrError(ctxErr error, textParts []string, fromProject, toProject string) (string, error) {

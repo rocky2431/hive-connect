@@ -240,6 +240,52 @@ func TestHandleRelay_TimeoutWithoutTextReturnsContextError(t *testing.T) {
 	}
 }
 
+func TestHandleRelay_SilentSessionHonorsContextAndStoppedGate(t *testing.T) {
+	t.Run("running engine returns on context cancellation", func(t *testing.T) {
+		engine := newTestEngine()
+		session := newControllableSession("silent-relay")
+		started := make(chan struct{})
+		engine.agent = &controllableAgent{startSessionFn: func(context.Context, string) (AgentSession, error) {
+			close(started)
+			return session, nil
+		}}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		result := make(chan error, 1)
+		go func() {
+			_, err := engine.HandleRelay(ctx, "source", "test:chat-1:user", "hello")
+			result <- err
+		}()
+		waitLifecycleSignal(t, started, "silent relay start")
+		cancel()
+		if err := waitLifecycleResult(t, result, "silent relay cancellation"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("HandleRelay() error = %v, want context canceled", err)
+		}
+		session.events <- Event{Type: EventResult, Content: "done", Done: true}
+		waitLifecycleSignal(t, session.closed, "silent relay background close")
+		if err := engine.Stop(); err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+	})
+
+	t.Run("stopped engine closes rejected drain", func(t *testing.T) {
+		engine := newTestEngine()
+		session := newControllableSession("stopped-relay")
+		engine.agent = &controllableAgent{nextSession: session}
+		if err := engine.Stop(); err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		_, err := engine.HandleRelay(ctx, "source", "test:chat-1:user", "hello")
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("HandleRelay() error = %v, want context canceled", err)
+		}
+		waitLifecycleSignal(t, session.closed, "rejected relay close")
+	})
+}
+
 // relayFallbackAgent fails the first StartSession call (simulating a corrupt
 // resume) and returns freshSession on the second call (fresh start).
 type relayFallbackAgent struct {

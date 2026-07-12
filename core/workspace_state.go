@@ -138,19 +138,31 @@ func (p *workspacePool) GetOrCreate(workspace string) *workspaceState {
 // ReapIdle removes and returns workspace paths that have been idle longer than idleTimeout.
 // A zero idleTimeout disables reaping entirely.
 func (p *workspacePool) ReapIdle() []string {
+	reapedStates := p.reapIdleStates()
+	reaped := make([]string, 0, len(reapedStates))
+	for path := range reapedStates {
+		reaped = append(reaped, path)
+	}
+	return reaped
+}
+
+// reapIdleStates transfers ownership of idle workspace states to the caller.
+// Engine uses the returned state pointers to stop their Agents before the
+// pointers become unreachable from the pool.
+func (p *workspacePool) reapIdleStates() map[string]*workspaceState {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.idleTimeout <= 0 {
 		return nil
 	}
 	cutoff := time.Now().Add(-p.idleTimeout)
-	var reaped []string
+	reaped := make(map[string]*workspaceState)
 	for path, state := range p.states {
 		if state.HasActiveTurn() {
 			continue
 		}
 		if state.LastActivity().Before(cutoff) {
-			reaped = append(reaped, path)
+			reaped[path] = state
 			delete(p.states, path)
 		}
 	}
