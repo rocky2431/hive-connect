@@ -404,11 +404,10 @@ func TestSend_WithImages_PassesImageArgsAndDefaultPrompt(t *testing.T) {
 
 	argsFile := filepath.Join(workDir, "args.txt")
 	script := "#!/bin/sh\n" +
-		"printf '%s\\n' \"$@\" > \"$CODEX_ARGS_FILE\"\n" +
+		fakeCodexAtomicArgsShell +
 		"printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}'\n" +
 		"printf '%s\\n' '{\"type\":\"turn.completed\"}'\n"
-	powershellScript := `
-[IO.File]::WriteAllLines($env:CODEX_ARGS_FILE, (fakeCodexArgs))
+	powershellScript := fakeCodexAtomicArgsPowerShell + `
 [Console]::Out.WriteLine('{"type":"thread.started","thread_id":"thread-1"}')
 [Console]::Out.WriteLine('{"type":"turn.completed"}')
 `
@@ -467,10 +466,9 @@ func TestSend_ResumeWithImages_PlacesSessionBeforeImageFlags(t *testing.T) {
 
 	argsFile := filepath.Join(workDir, "args.txt")
 	script := "#!/bin/sh\n" +
-		"printf '%s\\n' \"$@\" > \"$CODEX_ARGS_FILE\"\n" +
+		fakeCodexAtomicArgsShell +
 		"printf '%s\\n' '{\"type\":\"turn.completed\"}'\n"
-	powershellScript := `
-[IO.File]::WriteAllLines($env:CODEX_ARGS_FILE, (fakeCodexArgs))
+	powershellScript := fakeCodexAtomicArgsPowerShell + `
 [Console]::Out.WriteLine('{"type":"turn.completed"}')
 `
 	writeFakeCodexScript(t, binDir, script, powershellScript)
@@ -515,12 +513,11 @@ func TestSend_UsesStdinForMultilinePrompt(t *testing.T) {
 	argsFile := filepath.Join(workDir, "args.txt")
 	stdinFile := filepath.Join(workDir, "stdin.txt")
 	script := "#!/bin/sh\n" +
-		"printf '%s\\n' \"$@\" > \"$CODEX_ARGS_FILE\"\n" +
+		fakeCodexAtomicArgsShell +
 		"cat > \"$CODEX_STDIN_FILE\"\n" +
 		"printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-stdin\"}'\n" +
 		"printf '%s\\n' '{\"type\":\"turn.completed\"}'\n"
-	powershellScript := `
-[IO.File]::WriteAllLines($env:CODEX_ARGS_FILE, (fakeCodexArgs))
+	powershellScript := fakeCodexAtomicArgsPowerShell + `
 [IO.File]::WriteAllText($env:CODEX_STDIN_FILE, [Console]::In.ReadToEnd())
 [Console]::Out.WriteLine('{"type":"thread.started","thread_id":"thread-stdin"}')
 [Console]::Out.WriteLine('{"type":"turn.completed"}')
@@ -692,9 +689,8 @@ func TestWriteFakeCodexScript_PreservesArgsWithSpaces(t *testing.T) {
 	}
 
 	argsFile := filepath.Join(workDir, "args.txt")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CODEX_ARGS_FILE\"\n"
-	powershellScript := `[IO.File]::WriteAllLines($env:CODEX_ARGS_FILE, (fakeCodexArgs))
-`
+	script := "#!/bin/sh\n" + fakeCodexAtomicArgsShell
+	powershellScript := fakeCodexAtomicArgsPowerShell
 	writeFakeCodexScript(t, binDir, script, powershellScript)
 	t.Setenv("CODEX_ARGS_FILE", argsFile)
 
@@ -717,6 +713,19 @@ function fakeCodexArgs {
   }
   return @(Get-Content -LiteralPath $env:CODEX_FAKE_ARGS_FILE)
 }
+`
+
+// The fake CLI runs concurrently with the assertion goroutine. Publish its
+// argv snapshot only after the complete file has been written; otherwise a
+// reader can observe a valid but truncated prefix under scheduler pressure.
+const fakeCodexAtomicArgsShell = "args_tmp=\"${CODEX_ARGS_FILE}.tmp.$$\"\n" +
+	"printf '%s\\n' \"$@\" > \"$args_tmp\"\n" +
+	"mv -f \"$args_tmp\" \"$CODEX_ARGS_FILE\"\n"
+
+const fakeCodexAtomicArgsPowerShell = `
+$argsTemp = "$env:CODEX_ARGS_FILE.tmp.$PID"
+[IO.File]::WriteAllLines($argsTemp, (fakeCodexArgs))
+Move-Item -LiteralPath $argsTemp -Destination $env:CODEX_ARGS_FILE -Force
 `
 
 func writeFakeCodexScript(t *testing.T, dir, shellScript, powershellScript string) {
