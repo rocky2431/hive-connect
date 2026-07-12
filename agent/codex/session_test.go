@@ -280,57 +280,69 @@ func TestCodexPromptPreamble_EmptyIsNoop(t *testing.T) {
 
 func TestGetModelAndReasoningEffort_FromRuntimeConfigWhenUnset(t *testing.T) {
 	workDir := t.TempDir()
-	binDir := filepath.Join(workDir, "bin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		t.Fatalf("mkdir bin: %v", err)
-	}
-
-	script := `#!/bin/sh
-while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*)
-      printf '{"id":%s,"result":{"protocolVersion":"2"}}\n' "$id"
-      ;;
-    *'"method":"config/read"'*)
-      printf '{"id":%s,"result":{"config":{"model":"gpt-5.4","model_reasoning_effort":"xhigh"},"origins":{}}}\n' "$id"
-      ;;
-  esac
-done
-`
-	powershellScript := `
-while (($line = [Console]::In.ReadLine()) -ne $null) {
-  if ($line -like '*"method":"initialize"*') {
-    [Console]::Out.WriteLine('{"id":1,"result":{"protocolVersion":"2"}}')
-  } elseif ($line -like '*"method":"config/read"*') {
-    [Console]::Out.WriteLine('{"id":2,"result":{"config":{"model":"gpt-5.4","model_reasoning_effort":"xhigh"},"origins":{}}}')
-  }
-}
-`
-	writeFakeCodexScript(t, binDir, script, powershellScript)
-
-	// The full repository test gate runs packages concurrently. Give this
-	// process-backed RPC assertion enough room under scheduler pressure and pin
-	// the session to its fake CLI instead of mutating process-global PATH.
-	previousTimeout := codexRuntimeConfigTimeout
-	codexRuntimeConfigTimeout = 5 * time.Second
-	t.Cleanup(func() { codexRuntimeConfigTimeout = previousTimeout })
-	cliPath := filepath.Join(binDir, "codex")
-	if runtime.GOOS == "windows" {
-		cliPath += ".cmd"
-	}
-
-	cs, err := newCodexSession(context.Background(), cliPath, nil, workDir, "", "", "", "", "", nil, "", "", "")
+	cs, err := newCodexSession(
+		context.Background(),
+		os.Args[0],
+		[]string{"-test.run=^TestCodexRuntimeConfigHelperProcess$", "--"},
+		workDir,
+		"", "", "", "", "",
+		[]string{"GO_WANT_CODEX_RUNTIME_CONFIG_HELPER=1"},
+		"", "", "",
+	)
 	if err != nil {
 		t.Fatalf("newCodexSession: %v", err)
 	}
 	defer cs.Close()
 
 	if got := cs.GetModel(); got != "gpt-5.4" {
-		t.Fatalf("GetModel() = %q, want gpt-5.4", got)
+		t.Fatalf("GetModel() = %q, want gpt-5.4; runtime config error: %v", got, cs.runtimeCfgFetchErr)
 	}
 	if got := cs.GetReasoningEffort(); got != "xhigh" {
 		t.Fatalf("GetReasoningEffort() = %q, want xhigh", got)
+	}
+}
+
+// TestCodexRuntimeConfigHelperProcess makes this Go test binary act as a
+// deterministic Codex app-server. Keeping JSON-RPC parsing in-process avoids
+// shelling out to sed for every frame, which made this contract test exhaust
+// process/scheduler capacity when Go ran repository packages concurrently.
+func TestCodexRuntimeConfigHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_CODEX_RUNTIME_CONFIG_HELPER") != "1" {
+		return
+	}
+
+	type request struct {
+		ID     int64  `json:"id"`
+		Method string `json:"method"`
+	}
+
+	decoder := json.NewDecoder(os.Stdin)
+	encoder := json.NewEncoder(os.Stdout)
+	for {
+		var req request
+		if err := decoder.Decode(&req); err != nil {
+			os.Exit(0)
+		}
+
+		var result any
+		switch req.Method {
+		case "initialize":
+			result = map[string]any{"protocolVersion": "2"}
+		case "config/read":
+			result = map[string]any{
+				"config": map[string]any{
+					"model":                  "gpt-5.4",
+					"model_reasoning_effort": "xhigh",
+				},
+				"origins": map[string]any{},
+			}
+		default:
+			continue
+		}
+
+		if err := encoder.Encode(map[string]any{"id": req.ID, "result": result}); err != nil {
+			os.Exit(2)
+		}
 	}
 }
 
