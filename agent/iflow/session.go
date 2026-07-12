@@ -188,6 +188,7 @@ func (s *iflowSession) Send(prompt string, images []core.ImageAttachment, files 
 	slog.Debug("iflowSession: launching interactive turn", "resume", sid != "", "args", core.RedactArgs(args))
 
 	cmd := exec.CommandContext(turnCtx, s.cmd, args...)
+	configureIFlowCmdCancellation(cmd)
 	cmd.Dir = s.workDir
 	env := os.Environ()
 	if len(s.extraEnv) > 0 {

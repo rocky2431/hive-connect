@@ -3,9 +3,13 @@ package iflow
 import (
 	"context"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -375,26 +379,15 @@ func TestIFlowSessionPendingToolTimeoutClearsBusyState(t *testing.T) {
 	}
 
 	projectKey := iflowProjectKey(iflowResolvedWorkDir(workDir))
-	t.Setenv("IFLOW_TEST_PROJECT_KEY", projectKey)
-
-	cmdPath := filepath.Join(t.TempDir(), "fake-iflow.sh")
-	script := `#!/bin/sh
-set -eu
-sid="session-test"
-session_dir="$HOME/.iflow/projects/$IFLOW_TEST_PROJECT_KEY"
-mkdir -p "$session_dir"
-transcript="$session_dir/$sid.jsonl"
-cat >>"$transcript" <<'EOF'
-{"sessionId":"session-test","type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"run_shell_command:1","name":"run_shell_command","input":{"command":"ls -la"}}]}}
-{"sessionId":"session-test","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}
-EOF
-while :; do sleep 1; done
-`
-	if err := os.WriteFile(cmdPath, []byte(script), 0o755); err != nil {
-		t.Fatalf("WriteFile fake iflow: %v", err)
+	sessionDir := filepath.Join(homeDir, ".iflow", "projects", projectKey)
+	extraArgs := []string{"-test.run=^TestIFlowHelperProcess$", "--"}
+	extraEnv := []string{
+		"GO_WANT_IFLOW_HELPER_PROCESS=1",
+		"IFLOW_HELPER_MODE=pending-tool",
+		"IFLOW_TEST_SESSION_DIR=" + sessionDir,
 	}
 
-	sess, err := newIFlowSession(context.Background(), cmdPath, nil, workDir, "", "default", "", nil, 0)
+	sess, err := newIFlowSession(context.Background(), os.Args[0], extraArgs, workDir, "", "default", "", extraEnv, 0)
 	if err != nil {
 		t.Fatalf("newIFlowSession: %v", err)
 	}
@@ -427,6 +420,63 @@ while :; do sleep 1; done
 		}
 		t.Fatalf("Send #2 failed: %v", err)
 	}
+}
+
+// TestIFlowHelperProcess makes this Go test binary act as a deterministic
+// iFlow CLI. Keeping transcript creation and process lifetime in Go avoids the
+// shell/mkdir/cat/sleep process fanout that used to exhaust scheduler and PTY
+// capacity when repository packages ran concurrently.
+func TestIFlowHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_IFLOW_HELPER_PROCESS") != "1" {
+		return
+	}
+
+	switch os.Getenv("IFLOW_HELPER_MODE") {
+	case "pending-tool":
+		sessionDir := os.Getenv("IFLOW_TEST_SESSION_DIR")
+		if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+			_, _ = os.Stderr.WriteString("mkdir session dir: " + err.Error() + "\n")
+			os.Exit(2)
+		}
+		transcript := filepath.Join(sessionDir, "session-test.jsonl")
+		payload := "" +
+			`{"sessionId":"session-test","type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"run_shell_command:1","name":"run_shell_command","input":{"command":"ls -la"}}]}}` + "\n" +
+			`{"sessionId":"session-test","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}` + "\n"
+		if err := os.WriteFile(transcript, []byte(payload), 0o644); err != nil {
+			_, _ = os.Stderr.WriteString("write transcript: " + err.Error() + "\n")
+			os.Exit(2)
+		}
+		waitForIFlowHelperSignal()
+	case "spawn-grandchild":
+		child := exec.Command(os.Args[0], "-test.run=^TestIFlowHelperProcess$", "--")
+		child.Env = append(os.Environ(),
+			"GO_WANT_IFLOW_HELPER_PROCESS=1",
+			"IFLOW_HELPER_MODE=grandchild",
+		)
+		if err := child.Start(); err != nil {
+			_, _ = os.Stderr.WriteString("start grandchild: " + err.Error() + "\n")
+			os.Exit(2)
+		}
+		pidPath := os.Getenv("IFLOW_HELPER_GRANDCHILD_PID_FILE")
+		if err := os.WriteFile(pidPath, []byte(strconv.Itoa(child.Process.Pid)), 0o644); err != nil {
+			_ = child.Process.Kill()
+			_, _ = os.Stderr.WriteString("write grandchild pid: " + err.Error() + "\n")
+			os.Exit(2)
+		}
+		_ = child.Wait()
+	case "grandchild":
+		waitForIFlowHelperSignal()
+	default:
+		_, _ = os.Stderr.WriteString("unknown IFLOW_HELPER_MODE\n")
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func waitForIFlowHelperSignal() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	<-ctx.Done()
 }
 
 func TestIFlowSession_ContinueSessionTreatedAsFresh(t *testing.T) {
