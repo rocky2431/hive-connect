@@ -105,6 +105,8 @@ type cujAgentSession struct {
 
 	// observed
 	sentPrompts []string
+	sentImages  [][]ImageAttachment
+	sentFiles   [][]FileAttachment
 	closeCount  int
 }
 
@@ -125,9 +127,11 @@ func newCUJAgentSession() *cujAgentSession {
 	}
 }
 
-func (s *cujAgentSession) Send(prompt string, _ []ImageAttachment, _ []FileAttachment) error {
+func (s *cujAgentSession) Send(prompt string, images []ImageAttachment, files []FileAttachment) error {
 	s.mu.Lock()
 	s.sentPrompts = append(s.sentPrompts, prompt)
+	s.sentImages = append(s.sentImages, append([]ImageAttachment(nil), images...))
+	s.sentFiles = append(s.sentFiles, append([]FileAttachment(nil), files...))
 	reply := s.reply
 	delay := s.delayMs
 	override := s.nextEventOverride
@@ -149,6 +153,16 @@ func (s *cujAgentSession) Send(prompt string, _ []ImageAttachment, _ []FileAttac
 		}
 	}()
 	return nil
+}
+
+func (s *cujAgentSession) getLastAttachments() ([]ImageAttachment, []FileAttachment) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.sentPrompts) == 0 {
+		return nil, nil
+	}
+	index := len(s.sentPrompts) - 1
+	return append([]ImageAttachment(nil), s.sentImages[index]...), append([]FileAttachment(nil), s.sentFiles[index]...)
 }
 func (s *cujAgentSession) RespondPermission(_ string, _ PermissionResult) error { return nil }
 func (s *cujAgentSession) Events() <-chan Event                                 { return s.events }
@@ -1086,30 +1100,42 @@ func TestCUJ_A3_ImageReachesAgent(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
 
 	msg := &Message{
 		SessionKey: "test:img", Platform: "test", MessageID: "img1",
 		UserID: "img", UserName: "img",
-		Content: "what is in this image",
-		Images:  []ImageAttachment{{MimeType: "image/png", Data: []byte("\x89PNG fake"), FileName: "chart.png"}},
+		Content:  "what is in this image",
+		Images:   []ImageAttachment{{MimeType: "image/png", Data: []byte("\x89PNG fake"), FileName: "chart.png"}},
 		ReplyCtx: "ctx",
 	}
 	e.ReceiveMessage(plat, msg)
 
-	deadline := time.After(2 * time.Second)
-	for {
+	deadline := time.Now().Add(2 * time.Second)
+	var images []ImageAttachment
+	for time.Now().Before(deadline) {
 		agent.mu.Lock()
-		n := len(agent.sessions)
+		var session *cujAgentSession
+		if len(agent.sessions) > 0 {
+			session = agent.sessions[0]
+		}
 		agent.mu.Unlock()
-		if n > 0 {
+		if session != nil {
+			images, _ = session.getLastAttachments()
+		}
+		if len(images) > 0 {
 			break
 		}
-		select {
-		case <-deadline:
-			t.Fatal("agent never received the message with image")
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(images) != 1 || images[0].FileName != "chart.png" || string(images[0].Data) != "\x89PNG fake" {
+		t.Fatalf("agent image attachments = %#v", images)
+	}
+	for time.Now().Before(deadline) && len(plat.getSent()) == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(plat.getSent()) == 0 {
+		t.Fatal("image turn did not finish before test cleanup")
 	}
 }
 
@@ -1150,30 +1176,42 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
 
 	msg := &Message{
 		SessionKey: "test:file", Platform: "test", MessageID: "f1",
 		UserID: "file", UserName: "file",
-		Content: "read this file",
-		Files:   []FileAttachment{{MimeType: "text/plain", Data: []byte("hello world"), FileName: "note.txt"}},
+		Content:  "read this file",
+		Files:    []FileAttachment{{MimeType: "text/plain", Data: []byte("hello world"), FileName: "note.txt"}},
 		ReplyCtx: "ctx",
 	}
 	e.ReceiveMessage(plat, msg)
 
-	deadline := time.After(2 * time.Second)
-	for {
+	deadline := time.Now().Add(2 * time.Second)
+	var files []FileAttachment
+	for time.Now().Before(deadline) {
 		agent.mu.Lock()
-		n := len(agent.sessions)
+		var session *cujAgentSession
+		if len(agent.sessions) > 0 {
+			session = agent.sessions[0]
+		}
 		agent.mu.Unlock()
-		if n > 0 {
-			return
+		if session != nil {
+			_, files = session.getLastAttachments()
 		}
-		select {
-		case <-deadline:
-			t.Fatal("agent never received the message with file attachment")
-		default:
-			time.Sleep(10 * time.Millisecond)
+		if len(files) > 0 {
+			break
 		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(files) != 1 || files[0].FileName != "note.txt" || string(files[0].Data) != "hello world" {
+		t.Fatalf("agent file attachments = %#v", files)
+	}
+	for time.Now().Before(deadline) && len(plat.getSent()) == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(plat.getSent()) == 0 {
+		t.Fatal("file turn did not finish before test cleanup")
 	}
 }
 
@@ -2008,4 +2046,3 @@ func TestCUJ_H2_TwoPlatformsConcurrentNoBleed(t *testing.T) {
 		t.Fatal("platB received no replies")
 	}
 }
-

@@ -18,7 +18,9 @@ type sendRecord struct {
 }
 
 type recordingAgent struct {
-	session *recordingSession
+	mu       sync.Mutex
+	session  *recordingSession
+	sessions []*recordingSession
 }
 
 func newRecordingAgent() *recordingAgent {
@@ -28,8 +30,15 @@ func newRecordingAgent() *recordingAgent {
 func (a *recordingAgent) Name() string { return "recording-agent" }
 
 func (a *recordingAgent) StartSession(_ context.Context, sessionID string) (core.AgentSession, error) {
-	a.session.setID(sessionID)
-	return a.session, nil
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	session := a.session
+	if len(a.sessions) > 0 {
+		session = newRecordingSession()
+	}
+	session.setID(sessionID)
+	a.sessions = append(a.sessions, session)
+	return session, nil
 }
 
 func (a *recordingAgent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
@@ -37,7 +46,36 @@ func (a *recordingAgent) ListSessions(_ context.Context) ([]core.AgentSessionInf
 }
 
 func (a *recordingAgent) Stop() error {
-	return a.session.Close()
+	a.mu.Lock()
+	sessions := append([]*recordingSession(nil), a.sessions...)
+	a.mu.Unlock()
+	for _, session := range sessions {
+		if err := session.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *recordingAgent) waitTotalRecords(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		sessions := append([]*recordingSession(nil), a.sessions...)
+		a.mu.Unlock()
+		total := 0
+		for _, session := range sessions {
+			session.mu.Lock()
+			total += len(session.records)
+			session.mu.Unlock()
+		}
+		if total >= n {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for %d total Send calls", n)
 }
 
 type recordingSession struct {
@@ -212,6 +250,26 @@ func (p *mediaPlatform) waitTextContaining(t *testing.T, substr string) string {
 	texts, _, _, _ := p.snapshot()
 	t.Fatalf("timeout waiting for text containing %q, got %#v", substr, texts)
 	return ""
+}
+
+func (p *mediaPlatform) waitTextCount(t *testing.T, substr string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		texts, _, _, _ := p.snapshot()
+		count := 0
+		for _, text := range texts {
+			if strings.Contains(strings.ToLower(text), strings.ToLower(substr)) {
+				count++
+			}
+		}
+		if count >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	texts, _, _, _ := p.snapshot()
+	t.Fatalf("timeout waiting for %d texts containing %q, got %#v", want, substr, texts)
 }
 
 func newMediaEngine(t *testing.T) (*core.Engine, *recordingAgent, *mediaPlatform) {
@@ -420,8 +478,8 @@ func TestSendToSessionWithAttachmentsRequiresSessionWhenMultipleSessionsHaveAtta
 
 	engine.ReceiveMessage(platform, first)
 	engine.ReceiveMessage(platform, second)
-	agent.session.waitRecords(t, 2)
-	platform.waitTextContaining(t, "media ok")
+	agent.waitTotalRecords(t, 2)
+	platform.waitTextCount(t, "media ok", 2)
 
 	err := engine.SendToSessionWithAttachments(
 		"",
