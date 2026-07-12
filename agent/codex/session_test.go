@@ -309,9 +309,18 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
 `
 	writeFakeCodexScript(t, binDir, script, powershellScript)
 
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// The full repository test gate runs packages concurrently. Give this
+	// process-backed RPC assertion enough room under scheduler pressure and pin
+	// the session to its fake CLI instead of mutating process-global PATH.
+	previousTimeout := codexRuntimeConfigTimeout
+	codexRuntimeConfigTimeout = 5 * time.Second
+	t.Cleanup(func() { codexRuntimeConfigTimeout = previousTimeout })
+	cliPath := filepath.Join(binDir, "codex")
+	if runtime.GOOS == "windows" {
+		cliPath += ".cmd"
+	}
 
-	cs, err := newCodexSession(context.Background(), "codex", nil, workDir, "", "", "", "", "", nil, "", "", "")
+	cs, err := newCodexSession(context.Background(), cliPath, nil, workDir, "", "", "", "", "", nil, "", "", "")
 	if err != nil {
 		t.Fatalf("newCodexSession: %v", err)
 	}
