@@ -302,7 +302,10 @@ func TestActionBoundAttachmentUploadFailureIsVisibleAndNotSentInline(t *testing.
 }
 
 func TestUploadArtifactPayloadUsesCanonicalFrontendConsumableList(t *testing.T) {
-	payload := map[string]any{"filename": "report.xlsx"}
+	payload := map[string]any{
+		"filename": "report.xlsx",
+		"data":     "base64-file-content-must-not-be-duplicated-after-upload",
+	}
 	upload := map[string]any{
 		"workspace_path": "workspace/uploads/report.xlsx",
 		"artifacts": []any{map[string]any{
@@ -335,6 +338,9 @@ func TestUploadArtifactPayloadUsesCanonicalFrontendConsumableList(t *testing.T) 
 	if got, ok := payload["artifacts"].([]map[string]any); !ok || len(got) != 1 || got[0]["path"] != "workspace/uploads/report.xlsx" {
 		t.Fatalf("event payload artifacts = %#v", payload["artifacts"])
 	}
+	if _, duplicated := payload["data"]; duplicated {
+		t.Fatalf("successful artifact event duplicated inline file bytes: %#v", payload)
+	}
 	legacy, ok := payload["artifact"].(map[string]any)
 	if !ok || legacy["artifact_id"] != "artifact-real" {
 		t.Fatalf("legacy artifact field = %#v", payload["artifact"])
@@ -344,5 +350,18 @@ func TestUploadArtifactPayloadUsesCanonicalFrontendConsumableList(t *testing.T) 
 	}
 	if _, leaked := legacy["snapshot_storage_path"]; leaked {
 		t.Fatalf("legacy artifact field retained internal storage path: %#v", legacy)
+	}
+}
+
+func TestFailedArtifactBindingPreservesSessionOnlyInlineFallbackData(t *testing.T) {
+	payload := map[string]any{
+		"filename": "fallback.txt",
+		"data":     "base64-inline-fallback",
+	}
+	if _, err := bindUploadArtifacts(payload, map[string]any{"status": "upload-response-without-artifacts"}); err == nil {
+		t.Fatal("bindUploadArtifacts accepted response without artifacts")
+	}
+	if payload["data"] != "base64-inline-fallback" {
+		t.Fatalf("failed artifact binding removed inline fallback data: %#v", payload)
 	}
 }

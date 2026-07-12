@@ -872,6 +872,7 @@ func bindUploadArtifacts(payload, upload map[string]any) ([]map[string]any, erro
 	if err != nil {
 		return nil, err
 	}
+	delete(payload, "data")
 	payload["artifact"] = artifacts[0]
 	payload["artifacts"] = artifacts
 	return artifacts, nil

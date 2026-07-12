@@ -63,7 +63,10 @@ go run -tags 'no_web no_feishu no_telegram no_discord no_slack no_dingtalk no_we
   `message_id` / `replay_key` / `request_hash` receipt, and atomically persists
   the receipt before emitting a `file` or `image` event. Both the live event and
   the eventual terminal result expose the same top-level `artifacts` list, so
-  Hive's result consumer can attach the already-created backend artifacts.
+  Hive's result consumer can attach the already-created backend artifacts. A
+  successful upload removes the inline base64 `data` from the event instead of
+  duplicating file content in the event database; only a session-only message
+  whose upload failed may retain inline data as its compatibility fallback.
   Action-bound upload failure is returned as an error rather than being
   misreported as a successful, non-durable inline event. Session-only proactive
   messages without a cloud message binding retain the inline fallback.
