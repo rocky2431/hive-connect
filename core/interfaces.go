@@ -15,6 +15,12 @@ type Platform interface {
 	Stop() error
 }
 
+// TurnResultSender separates progress messages from a durable execution outcome.
+// Done marks a successful runtime result; Error marks failure; neither means unknown.
+type TurnResultSender interface {
+	SendTurnResult(ctx context.Context, replyCtx any, result Event) error
+}
+
 // ErrNotSupported indicates a platform doesn't support a particular operation.
 var ErrNotSupported = errors.New("operation not supported by this platform")
 

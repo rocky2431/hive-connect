@@ -215,26 +215,39 @@ func (p *Platform) closeConn() error {
 }
 
 func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
+	return p.SendTurnResult(ctx, rctx, core.Event{Type: core.EventResult, Done: true, Content: content})
+}
+
+func (p *Platform) SendTurnResult(ctx context.Context, rctx any, event core.Event) error {
 	rc, err := replyContextFromAny(rctx)
 	if err != nil {
 		return err
 	}
 	if rc.MessageID == "" {
 		return p.sendEvent(ctx, rc, "text", map[string]any{
-			"text":    content,
-			"content": content,
+			"text":    event.Content,
+			"content": event.Content,
 		})
 	}
 	if p.receipts == nil {
 		return errors.New("hive: execution receipt store is unavailable")
 	}
-	result, err := p.receipts.complete(rc.ReplayKey, rc.MessageID, rc.RequestHash, resultFrame{
+	frame := resultFrame{
 		Type:      "result",
 		SessionID: rc.SessionID,
 		MessageID: rc.MessageID,
 		Status:    "completed",
-		Output:    content,
-	})
+		Output:    event.Content,
+	}
+	if !event.Done || event.Error != nil {
+		frame.Status = "failed"
+		frame.ErrorCode = "local_execution_outcome_unknown"
+		if event.Error != nil {
+			frame.ErrorCode = "local_execution_failed"
+			frame.Output = strings.TrimSpace(frame.Output + "\n" + event.Error.Error())
+		}
+	}
+	result, err := p.receipts.complete(rc.ReplayKey, rc.MessageID, rc.RequestHash, frame)
 	if err != nil {
 		return fmt.Errorf("hive: persist execution result: %w", err)
 	}
@@ -242,7 +255,11 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 }
 
 func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
-	return p.Reply(ctx, rctx, content)
+	rc, err := replyContextFromAny(rctx)
+	if err != nil {
+		return err
+	}
+	return p.sendEvent(ctx, rc, "text", map[string]any{"text": content, "content": content})
 }
 
 func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {

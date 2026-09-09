@@ -216,8 +216,8 @@ func TestPlatformWebSocketRoundTrip(t *testing.T) {
 	received := make(chan *core.Message, 1)
 	if err := plat.Start(func(p core.Platform, msg *core.Message) {
 		received <- msg
-		if err := p.Send(context.Background(), msg.ReplyCtx, "hello from local"); err != nil {
-			t.Errorf("Send returned error: %v", err)
+		if err := p.Reply(context.Background(), msg.ReplyCtx, "hello from local"); err != nil {
+			t.Errorf("Reply returned error: %v", err)
 		}
 	}); err != nil {
 		t.Fatalf("Start returned error: %v", err)

@@ -4722,6 +4722,27 @@ func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, sta
 	var partialText string
 	triggerAutoCompress := false
 	pendingSend := sendDone
+	turnResultSent := false
+	var turnFailure error
+	finishTurn := func(p Platform, result Event) bool {
+		sender, ok := p.(TurnResultSender)
+		if !ok {
+			return false
+		}
+		turnResultSent = true
+		if err := sender.SendTurnResult(e.ctx, replyCtx, result); err != nil {
+			slog.Error("platform terminal result failed", "platform", p.Name(), "error", err)
+		}
+		return true
+	}
+	defer func() {
+		if !turnResultSent {
+			state.mu.Lock()
+			p := state.platform
+			state.mu.Unlock()
+			finishTurn(p, Event{Type: EventError, Content: strings.Join(textParts, ""), Error: turnFailure})
+		}
+	}()
 
 	// stopTyping tracks the current turn's typing indicator so it can be
 	// stopped when a queued message starts a new turn.
@@ -4826,6 +4847,7 @@ func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, sta
 		case err := <-pendingSend:
 			pendingSend = nil
 			if err != nil {
+				turnFailure = err
 				slog.Error("failed to send prompt", "error", err, "session_key", sessionKey)
 				sp.discard()
 				if stopTyping != nil {
@@ -4844,6 +4866,7 @@ func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, sta
 			}
 			continue
 		case <-idleCh:
+			turnFailure = errors.New("agent session timed out")
 			slog.Error("agent session idle timeout: no events for too long, killing session",
 				"session_key", sessionKey, "timeout", e.eventIdleTimeout, "elapsed", time.Since(turnStart))
 			cp.Finalize(ProgressCardStateFailed)
@@ -4856,6 +4879,7 @@ func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, sta
 			e.cleanupInteractiveState(sessionKey, state)
 			return
 		case <-turnDeadlineCh:
+			turnFailure = errors.New("agent turn exceeded maximum time")
 			elapsed := time.Since(turnStart)
 			slog.Warn("agent turn exceeded max_turn_time: sending stop signal, will force-kill if needed",
 				"session_key", sessionKey, "max_turn_time", e.maxTurnTime, "elapsed", elapsed)
@@ -5608,8 +5632,15 @@ func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, sta
 
 			replyStart := time.Now()
 
-			// --- StreamingCard path ---
-			if streamCard != nil && !streamCard.Failed() {
+			// Protocol-aware platforms commit exactly one runtime result, not progress chunks.
+			terminalEvent := event
+			terminalEvent.Content = workspaceRenderer(fullResponse)
+			if isSilent {
+				terminalEvent.Content = ""
+			}
+			if finishTurn(p, terminalEvent) {
+				sp.discard()
+			} else if streamCard != nil && !streamCard.Failed() {
 				sp.finish("", "") // cleanup preview (should be no-op if card was active)
 				// Build final card content with full response
 				finalContent := buildCardContent(cardThinkingText, cardToolCalls, fullResponse)
@@ -5846,6 +5877,8 @@ func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, sta
 				e.i18n.DetectAndSet(queued.content)
 
 				// Reset per-turn state for the next turn
+				turnResultSent = false
+				turnFailure = nil
 				msgID = queued.messageID
 				textParts = nil
 				segmentStart = 0
@@ -5939,6 +5972,7 @@ func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, sta
 			return
 
 		case EventError:
+			turnFailure = event.Error
 			cp.Finalize(ProgressCardStateFailed)
 			sp.discard()
 			state.mu.Lock()
