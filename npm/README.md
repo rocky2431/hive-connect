@@ -2,6 +2,12 @@
 
 Connect a local AI agent to Hive as a user-scoped IM channel.
 
+## v0.1.10
+
+Progress messages no longer finalize an execution receipt. Hive receives the actual
+terminal result or failure, while the existing connection and replay protection are
+preserved. Upgrading does not require a new login.
+
 ## Install
 
 ```bash
